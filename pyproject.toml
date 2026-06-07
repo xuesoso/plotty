@@ -1,0 +1,74 @@
+[project]
+name = "plotty"
+version = "1.0.0"
+description = "Inline matplotlib plots in your terminal via sixel, in a tmux pane, over SSH"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [{ name = "xuesoso", email = "xuesoso@gmail.com" }]
+keywords = ["matplotlib", "sixel", "tmux", "ssh", "terminal", "plotting", "repl"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Framework :: Matplotlib",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+
+# Runtime deps only. numpy ships with matplotlib but plotty imports it directly,
+# so it's declared. Floors are kept low for Python 3.7 support — the resolver
+# picks newer versions automatically on newer Pythons. Everything else (pandas,
+# jupyter, ...) is dev-only — see below.
+dependencies = [
+    "matplotlib>=3.5",
+    "numpy>=1.17",
+]
+
+[project.urls]
+Homepage = "https://github.com/xuesoso/plotty"
+Repository = "https://github.com/xuesoso/plotty"
+
+[project.scripts]
+plotty-view = "plotty:view"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# Single-module package living at src/plotty.py -> importable as `plotty`.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["plotty"]
+
+# Tools for developing/testing plotty itself. Add your analysis packages here
+# (pandas, seaborn, plotly, jupyter, ...) if you want `uv sync` to install them.
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ipython>=7.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py37"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.7"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
