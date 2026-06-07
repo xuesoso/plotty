@@ -1,6 +1,9 @@
 # plotty
 
 [![CI](https://github.com/xuesoso/plotty/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xuesoso/plotty/actions/workflows/ci.yml)
+[![security: pip-audit](https://img.shields.io/badge/security-pip--audit-blue.svg)](https://github.com/xuesoso/plotty/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.7%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > Inline matplotlib plots in your terminal — rendered as **sixel** in a dedicated
 > tmux pane, **including over SSH**. No browser, no X11, no Jupyter server.
