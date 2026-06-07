@@ -1,12 +1,12 @@
 # plotty
 
+[![CI](https://github.com/xuesoso/plotty/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xuesoso/plotty/actions/workflows/ci.yml)
+
 > Inline matplotlib plots in your terminal — rendered as **sixel** in a dedicated
 > tmux pane, **including over SSH**. No browser, no X11, no Jupyter server.
 
 <p align="center">
-  <!-- TODO: replace with a demo screenshot or GIF, e.g. docs/demo.gif
-       (ipython in one pane, the plot rendered live in the adjacent pane) -->
-  <img src="docs/demo.gif" alt="plotty demo" width="720">
+  <img src="images/plotty_1.gif" alt="plotty demo" width="720">
 </p>
 
 `plotty` is a matplotlib backend that draws figures directly in your terminal, so
@@ -99,6 +99,19 @@ so split a pane first (`Ctrl-b "`), then call `enable()`. Target another pane wi
 
 Public API: `enable()`, `disable()`, `redraw()`, `view()`.
 
+### Demo
+
+Run the bundled example to see it in action (split off a plot pane first, then
+`python examples/demo.py`). The GIF below is the expected output:
+
+```bash
+python examples/demo.py
+```
+
+<p align="center">
+  <img src="images/plotty_2.gif" alt="plotty rendering the examples/demo.py plots in a tmux pane" width="720">
+</p>
+
 ## How it works
 
 Two cooperating pieces share state via the filesystem + OS signals:
@@ -188,12 +201,6 @@ tmux display-message -p '#{client_termfeatures}'   # should contain "sixel"
 ```
 
 Both tmux layers must be ≥ 3.4 and built with sixel.
-
-<p align="center">
-  <!-- TODO: replace with a screenshot or GIF of the nested local+remote tmux
-       workflow (ssh into a remote tmux, plot rendering back on the local terminal) -->
-  <img src="docs/nested-tmux.gif" alt="plotty over nested tmux + ssh" width="720">
-</p>
 
 ## Configuration reference
 
