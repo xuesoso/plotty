@@ -32,6 +32,7 @@ PLOTTY_SIZE, PLOTTY_INLINE.
 import os
 import re
 import sys
+import select
 import signal
 import shlex
 import shutil
@@ -340,9 +341,25 @@ def _alive(pid):
     return True
 
 
+def _is_viewer(pid):
+    """True if pid is a live plotty viewer process.
+
+    Pids get recycled: after an unclean shutdown a stale pidfile can point at an
+    unrelated process, and signalling it (SIGUSR1's default action: terminate)
+    would kill an innocent program — on macOS that pops a "quit unexpectedly"
+    crash dialog. Verify the command line before ever sending a signal.
+    """
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                             capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return False
+    return "--view" in out or "plotty-view" in out
+
+
 def _signal_viewer():
     pid = _read_pid()
-    if _alive(pid):
+    if _alive(pid) and _is_viewer(pid):
         try:
             os.kill(pid, signal.SIGUSR1)
             return True
@@ -495,46 +512,81 @@ def _apply_env():
 
 
 def view():
+    """Viewer loop: redraw last.png on SIGUSR1 (new figure) / SIGWINCH (resize),
+    exit on SIGTERM/SIGINT/SIGHUP.
+
+    Signal handlers do no work — the kernel writes the signal number to a
+    self-pipe (signal.set_wakeup_fd) and all rendering/writing happens in the
+    main loop. That avoids handler reentrancy during resize bursts and
+    unguarded writes to a dying pty, and every exit path is a clean
+    os._exit(0): an abnormal viewer exit (traceback or fatal signal) makes
+    macOS pop a "Python quit unexpectedly" crash dialog when the surrounding
+    session is torn down. Draining the pipe for ~50 ms also coalesces signal
+    bursts, so a resize storm redraws once.
+    """
     _apply_env()
     clear = _env("CLEAR", "1" if _cfg["clear"] else "0") != "0"
 
-    def _draw(*_):
-        if not os.path.exists(_last):
-            return
-        try:
-            data = _render_bytes(_last, _out_fd())
-        except Exception:
-            return
-        buf = sys.stdout.buffer
-        if clear:
-            buf.write(b"\x1b[H\x1b[2J")           # home + clear screen
-        buf.write(data)
-        buf.flush()
+    draw_sigs = {int(getattr(signal, n)) for n in ("SIGUSR1", "SIGWINCH")
+                 if hasattr(signal, n)}
+    quit_sigs = {int(getattr(signal, n)) for n in ("SIGTERM", "SIGINT", "SIGHUP")
+                 if hasattr(signal, n)}
 
-    def _bye(*_):
+    def _cleanup():
         try:
             if _read_pid() == os.getpid():
                 os.remove(_pidfile)
         except OSError:
             pass
-        os._exit(0)
 
-    with open(_pidfile, "w") as f:
-        f.write(str(os.getpid()))
-    handlers = {"SIGUSR1": _draw, "SIGWINCH": _draw,    # new figure / pane resize
-                "SIGTERM": _bye, "SIGINT": _bye, "SIGHUP": _bye}
-    for name, handler in handlers.items():
-        if hasattr(signal, name):
-            signal.signal(getattr(signal, name), handler)
-    _draw()
-    while True:
-        signal.pause()
+    def _draw():
+        """Render last.png to stdout. False means the tty is gone: exit."""
+        if not os.path.exists(_last):
+            return True
+        try:
+            data = _render_bytes(_last, _out_fd())
+        except Exception:
+            return True                          # bad/partial image: skip frame
+        try:
+            out = sys.stdout.buffer
+            if clear:
+                out.write(b"\x1b[H\x1b[2J")      # home + clear screen
+            out.write(data)
+            out.flush()
+            return True
+        except OSError:                          # EPIPE/EIO: pane is gone
+            return False
+
+    try:
+        if hasattr(signal, "SIGPIPE"):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        rfd, wfd = os.pipe()
+        os.set_blocking(wfd, False)
+        signal.set_wakeup_fd(wfd)                # kernel writes signal numbers here
+        for sig in draw_sigs | quit_sigs:
+            signal.signal(sig, lambda *_: None)  # neutralize default dispositions
+        with open(_pidfile, "w") as f:
+            f.write(str(os.getpid()))
+        ok = _draw()
+        while ok:
+            sigs = set(os.read(rfd, 128))        # blocks: zero CPU while idle
+            while select.select([rfd], [], [], 0.05)[0]:
+                sigs |= set(os.read(rfd, 128))   # coalesce resize/figure bursts
+            if sigs & quit_sigs:
+                break
+            if sigs & draw_sigs:
+                ok = _draw()
+    except BaseException:
+        pass                                     # never crash out of the viewer
+    _cleanup()
+    os._exit(0)
 
 
 # ---- setup / teardown -------------------------------------------------------
 
 def _ensure_viewer():
-    if _alive(_read_pid()):
+    pid = _read_pid()
+    if _alive(pid) and _is_viewer(pid):      # don't trust recycled pids
         return
     # Always pass IMGCAT (empty == built-in) so the viewer's renderer matches the
     # backend's, regardless of any PLOTTY_IMGCAT inherited by the pane's shell.
@@ -702,7 +754,7 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
 def disable():
     """Stop the viewer, unhook auto-display, and quiet matplotlib output."""
     pid = _read_pid()
-    if _alive(pid):
+    if _alive(pid) and _is_viewer(pid):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:

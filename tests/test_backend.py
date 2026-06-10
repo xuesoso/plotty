@@ -126,7 +126,8 @@ def test_signal_viewer_dead_pid_returns_false():
     assert plotty._signal_viewer() is False
 
 
-def test_signal_viewer_live_pid_sends_sigusr1(monkeypatch):
+def test_signal_viewer_live_pid_sends_sigusr1(monkeypatch, fake_run):
+    fake_run.responses = {"ps -p": "python /x/plotty.py --view\n"}
     sent = []
 
     def fake_kill(pid, sig):
@@ -138,6 +139,38 @@ def test_signal_viewer_live_pid_sends_sigusr1(monkeypatch):
         f.write(str(os.getpid()))
     assert plotty._signal_viewer() is True
     assert (os.getpid(), signal.SIGUSR1) in sent
+
+
+def test_is_viewer_matches_only_viewer_commands(fake_run):
+    fake_run.responses = {"ps -p": "python /x/plotty.py --view\n"}
+    assert plotty._is_viewer(123) is True
+    fake_run.responses = {"ps -p": "/Applications/Some.app/Contents/MacOS/Some\n"}
+    assert plotty._is_viewer(123) is False
+
+
+def test_signal_viewer_never_signals_recycled_pid(monkeypatch, fake_run):
+    # a stale pidfile pointing at a recycled (non-viewer) pid must NOT be
+    # signalled — SIGUSR1's default action would terminate an innocent process
+    fake_run.responses = {"ps -p": "/Applications/Some.app/Contents/MacOS/Some\n"}
+    sent = []
+
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        if sig == 0:
+            return
+    monkeypatch.setattr(plotty.os, "kill", fake_kill)
+    with open(plotty._pidfile, "w") as f:
+        f.write(str(os.getpid()))
+    assert plotty._signal_viewer() is False
+    assert (os.getpid(), signal.SIGUSR1) not in sent
+
+
+def test_ensure_viewer_respawns_over_recycled_pid(fake_run):
+    with open(plotty._pidfile, "w") as f:
+        f.write(str(os.getpid()))          # alive, but it's pytest, not a viewer
+    plotty._cfg.update(imgcat=None, pane="%1", size=60, tmux="tmux")
+    plotty._ensure_viewer()                # ps (via fake_run) says "not a viewer"
+    assert any("send-keys" in " ".join(c) for c in fake_run.calls)
 
 
 # ---- inline rendering: pane tty vs stdout -----------------------------------
