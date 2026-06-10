@@ -96,11 +96,12 @@ plt.plot([1, 4, 9, 16])
 plotty.disable()                # stop the viewer and restore matplotlib
 ```
 
-Inside tmux, plotty draws into the **last pane** of the current window by default,
-so split a pane first (`Ctrl-b "`), then call `enable()`. Target another pane with
+Inside tmux, plotty draws into another pane of the current window (the last one
+that isn't your REPL). If the window only has your REPL pane, `enable()`
+automatically splits off a plot pane. Target a specific pane with
 `enable(target_pane=...)`.
 
-Public API: `enable()`, `disable()`, `redraw()`, `view()`.
+Public API: `enable()`, `disable()`, `redraw()`, `view()`, `__version__`.
 
 ### Demo
 
@@ -123,8 +124,10 @@ Two cooperating pieces share state via the filesystem + OS signals:
   PNG, atomically publishes it to `~/.cache/plotty/last.png`, and signals the
   viewer.
 - **Viewer** (runs in the plot pane): redraws on a new figure (`SIGUSR1`) and on
-  pane resize/zoom (`SIGWINCH`). It's event-driven (`signal.pause()`), idle at
-  zero CPU, and self-cleaning.
+  pane resize/zoom (`SIGWINCH`). It's event-driven via a self-pipe (zero CPU
+  when idle), coalesces resize bursts into a single redraw, cleans up after
+  itself, and always exits cleanly (no crash dialogs when a session is torn
+  down).
 
 Because only sixel bytes cross SSH and everything else is host-local, remote use
 is identical to local.
@@ -143,10 +146,18 @@ is identical to local.
 plotty.enable(inline=True)      # force inline even inside tmux
 ```
 
+plotty never injects bytes into the console you are typing in: outside tmux,
+viewer-pane mode falls back to inline, and auto-selected inline first queries
+the terminal for sixel support — if it has none (e.g. an IDE console), plotty
+warns and skips display instead of printing escape garbage. An explicit
+`enable(inline=True)` is trusted and always writes.
+
 ## Sixel encoders
 
 plotty ships with a **built-in, dependency-free sixel encoder** (pure stdlib +
-numpy), so it works out of the box with no external tools.
+numpy), so it works out of the box with no external tools. It quantizes over the
+image's distinct colors — exact (lossless) when there are ≤256, fast
+count-weighted median-cut otherwise.
 
 If one is on your `PATH`, plotty auto-detects an external encoder for
 higher-quality (dithered) output, in priority order:
@@ -235,6 +246,9 @@ raise `dpi` so the source has enough pixels.
 - **Nothing appears:** check `tmux -V` ≥ 3.4 and sixel support
   (`strings $(command -v tmux) | grep -i sixel`); confirm your terminal supports
   sixel; run `plotty.enable(verbose=1)` to print diagnostics.
+- **"figures will not be displayed" warning:** your terminal didn't advertise
+  sixel support when queried (common in IDE consoles) — use a sixel-capable
+  terminal or tmux, or force output with `enable(inline=True)`.
 - **Image too large / small:** tune `size`. Blurry when enlarged? raise `dpi`.
 - **Plot doesn't refresh when you resize the pane:** use viewer mode (the default
   in tmux); inline mode doesn't auto-redraw on resize.

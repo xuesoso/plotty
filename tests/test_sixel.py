@@ -133,6 +133,16 @@ def test_quantize_single_color():
     assert set(idx.tolist()) == {0}
 
 
+def test_quantize_fast_path_exact_for_many_distinct_colors():
+    # 200 distinct colors (<= 256): exact palette, perfect reconstruction
+    rows = np.arange(200, dtype=np.uint8)
+    img = np.stack([rows, rows[::-1], np.full(200, 7, np.uint8)], axis=-1)
+    img = img[None].repeat(3, axis=0)            # (3, 200, 3)
+    pal, idx = plotty._quantize(img)
+    assert len(np.unique(pal, axis=0)) == 200
+    assert np.array_equal(pal[idx].reshape(img.shape), img)
+
+
 # ---- _resize ----------------------------------------------------------------
 
 def test_resize_shapes():

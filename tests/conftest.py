@@ -54,6 +54,7 @@ def fake_run(monkeypatch):
 def _isolate():
     """Snapshot/restore _cfg and clear stray cache files around each test."""
     snap = dict(plotty._cfg)
+    plotty._warned.clear()
     for path in (plotty._pidfile, plotty._last):
         try:
             os.remove(path)

@@ -1,9 +1,21 @@
 """Tests for command construction, signalling, inline detection, health check."""
 
 import os
+import re
 import signal
+import pathlib
 
 import plotty
+
+
+# ---- __version__ --------------------------------------------------------------
+
+def test_version_matches_pyproject():
+    root = pathlib.Path(plotty.__file__).resolve().parents[1]
+    text = (root / "pyproject.toml").read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    assert m, "pyproject.toml has no version"
+    assert plotty.__version__ == m.group(1)
 
 
 # ---- renderer detection (sixel-only) ----------------------------------------
@@ -108,10 +120,49 @@ def test_resolve_pane_named_passthrough():
     assert plotty._resolve_pane("Plots:0.1") == "Plots:0.1"
 
 
-def test_resolve_pane_negative_indexes_pane_ids(fake_run):
+def test_resolve_pane_negative_indexes_pane_ids(fake_run, monkeypatch):
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     fake_run.responses = {"list-panes": "%10\n%11\n%12\n"}
     assert plotty._resolve_pane(-1) == "%12"
     assert plotty._resolve_pane(-2) == "%11"
+
+
+def test_resolve_pane_skips_repl_own_pane(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "%12")     # REPL lives in the last pane
+    fake_run.responses = {"list-panes": "%10\n%11\n%12\n"}
+    assert plotty._resolve_pane(-1) == "%11"   # never draw into the REPL itself
+
+
+def test_ensure_separate_pane_splits_when_only_own_pane(fake_run, monkeypatch, capsys):
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    fake_run.responses = {"list-panes": "%5\n", "split-window": "%7\n"}
+    plotty._cfg.update(tmux="tmux")
+    pane = plotty._ensure_separate_pane(-1, verbose=1)
+    assert pane == "%7"
+    assert plotty._cfg["can_display"] is True
+    split = next(c for c in fake_run.calls if "split-window" in c)
+    assert "-d" in split                       # don't steal focus from the REPL
+    assert "created plot pane" in capsys.readouterr().err
+
+
+def test_ensure_separate_pane_failure_disables_display(fake_run, monkeypatch, capsys):
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    fake_run.responses = {"list-panes": "%5\n"}   # split-window returns nothing
+    plotty._cfg.update(tmux="tmux", can_display=True)
+    pane = plotty._ensure_separate_pane(-1, verbose=1)
+    assert pane == "%5"
+    assert plotty._cfg["can_display"] is False
+    assert "cannot display figures" in capsys.readouterr().err
+
+
+def test_display_figure_skipped_when_cannot_display(monkeypatch, capsys):
+    plotty._cfg.update(can_display=False, inline=False)
+    published = []
+    monkeypatch.setattr(plotty, "_publish", lambda fig: published.append(fig))
+    plotty._display_figure(object())           # no savefig, no tmux, just a warning
+    plotty._display_figure(object())
+    assert published == []                     # display fully skipped
+    assert capsys.readouterr().err.count("not displayed") == 1   # warn once
 
 
 # ---- signalling -------------------------------------------------------------
@@ -248,11 +299,44 @@ def test_enable_force_inline_in_tmux(monkeypatch, fake_run):
     assert not any("send-keys" in " ".join(c) for c in fake_run.calls)
 
 
-def test_enable_force_pane_mode_outside_tmux(monkeypatch, fake_run):
+def test_enable_outside_tmux_forces_inline(monkeypatch, fake_run, capsys):
+    # pane mode is impossible outside tmux: fall back to inline + warn instead
+    # of send-keys'ing into arbitrary panes
     monkeypatch.delenv("TMUX", raising=False)
-    plotty.enable(imgcat="img2sixel", inline=False, viewer=False, verbose=0)
-    assert plotty._cfg["inline"] is False
-    assert any("list-panes" in " ".join(c) for c in fake_run.calls)
+    plotty.enable(imgcat="img2sixel", inline=False, viewer=False, verbose=1)
+    assert plotty._cfg["inline"] is True
+    assert not any("list-panes" in " ".join(c) for c in fake_run.calls)
+    assert "falling back to inline" in capsys.readouterr().err
+
+
+def test_enable_auto_inline_blocks_non_sixel_terminal(monkeypatch, fake_run, capsys):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(plotty, "_stdout_supports_sixel", lambda: False)
+    plotty.enable(imgcat="builtin", viewer=False, verbose=1)
+    assert plotty._cfg["can_display"] is False
+    assert "does not appear to support sixel" in capsys.readouterr().err
+
+
+def test_enable_auto_inline_allows_sixel_terminal(monkeypatch, fake_run):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(plotty, "_stdout_supports_sixel", lambda: True)
+    plotty.enable(imgcat="builtin", viewer=False, verbose=0)
+    assert plotty._cfg["can_display"] is True
+
+
+def test_enable_explicit_inline_skips_sixel_check(monkeypatch, fake_run):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(plotty, "_stdout_supports_sixel",
+                        lambda: (_ for _ in ()).throw(AssertionError("not called")))
+    plotty.enable(imgcat="builtin", inline=True, viewer=False, verbose=0)
+    assert plotty._cfg["can_display"] is True   # user forced it: trust them
+
+
+def test_parse_da1():
+    assert plotty._parse_da1(b"\x1b[?62;4;22c") is True       # sixel advertised
+    assert plotty._parse_da1(b"\x1b[?64;1;2;6;9;15;21;22c") is False
+    assert plotty._parse_da1(b"\x1b[?6c") is False             # IDE-style reply
+    assert plotty._parse_da1(b"") is None                      # no reply at all
 
 
 def test_enable_force_builtin(monkeypatch, fake_run):
@@ -283,10 +367,57 @@ def test_display_figure_uses_dpi(monkeypatch):
     class FakeFig:
         def savefig(self, path, **kw):
             captured.update(kw)
-            open(path, "wb").close()             # so _publish has a file to copy
+            open(path, "wb").close()             # savefig writes the .part file
 
     plotty._display_figure(FakeFig())
     assert captured.get("dpi") == 222
+
+
+def test_publish_saves_once_directly_to_last(monkeypatch):
+    plotty._cfg.update(dpi=None, inline=False)
+    monkeypatch.setattr(plotty, "_signal_viewer", lambda: True)
+    saves = []
+
+    class FakeFig:
+        def savefig(self, path, **kw):
+            saves.append((path, kw.get("format")))
+            open(path, "wb").close()
+
+    plotty._display_figure(FakeFig())
+    # exactly one write, to the temp part file, with an explicit png format
+    assert saves == [(plotty._last + ".part", "png")]
+    assert os.path.exists(plotty._last)          # atomically published
+
+
+def test_publish_failure_warns_once_and_skips_display(monkeypatch, capsys):
+    plotty._cfg.update(dpi=None, inline=False)
+    signaled = []
+    monkeypatch.setattr(plotty, "_signal_viewer",
+                        lambda: signaled.append(1) or True)
+
+    class BadFig:
+        def savefig(self, path, **kw):
+            raise OSError("disk full")
+
+    plotty._display_figure(BadFig())
+    plotty._display_figure(BadFig())
+    assert capsys.readouterr().err.count("cannot write") == 1   # warned exactly once
+    assert signaled == []                                       # nothing displayed
+
+
+def test_invalid_dpi_is_ignored_with_warning(monkeypatch, capsys):
+    plotty._cfg.update(dpi="garbage", inline=False)
+    monkeypatch.setattr(plotty, "_signal_viewer", lambda: True)
+    captured = {}
+
+    class FakeFig:
+        def savefig(self, path, **kw):
+            captured.update(kw)
+            open(path, "wb").close()
+
+    plotty._display_figure(FakeFig())
+    assert "dpi" not in captured                 # bad value dropped, figure still shown
+    assert "invalid dpi" in capsys.readouterr().err
 
 
 def test_enable_dpi_from_env(monkeypatch, fake_run):
@@ -341,13 +472,6 @@ def test_health_check_inline_in_tmux_message(monkeypatch, capsys, fake_run):
     plotty._health_check(verbose=1)
     err = capsys.readouterr().err
     assert "inline mode" in err and "the target tmux pane" in err
-
-
-def test_health_check_pane_mode_without_tmux_warns(monkeypatch, capsys, fake_run):
-    monkeypatch.delenv("TMUX", raising=False)
-    plotty._cfg["inline"] = False
-    plotty._health_check(verbose=1)
-    assert "pane routing will not work" in capsys.readouterr().err
 
 
 def test_health_check_old_tmux_warns(monkeypatch, capsys, fake_run):

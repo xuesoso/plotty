@@ -21,6 +21,10 @@ Display modes: a viewer process running in a tmux pane (default in tmux), or
 pane's tty when in tmux, or to the current terminal's stdout when not. Choose
 with enable(inline=...) / PLOTTY_INLINE.
 
+plotty never draws into the pane you are typing in: if the tmux window has no
+separate pane, enable() splits one off automatically; without a usable sixel
+display (e.g. an IDE console), it warns instead of printing escape garbage.
+
 To rename this package, just rename the file: the matplotlib backend string is
 derived from the module name automatically.
 
@@ -36,8 +40,6 @@ import select
 import signal
 import shlex
 import shutil
-import tempfile
-import itertools
 import subprocess
 
 import numpy as np
@@ -47,6 +49,34 @@ from matplotlib._pylab_helpers import Gcf
 from matplotlib.backends import backend_agg
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+
+def _find_version():
+    """Resolve __version__ with pyproject.toml as the single source of truth:
+    read it directly in a source checkout, else ask the installed package
+    metadata (which setuptools filled from pyproject.toml at build time)."""
+    try:
+        pyproject = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 os.pardir, "pyproject.toml")
+        with open(pyproject) as f:
+            m = re.search(r'^version\s*=\s*"([^"]*)"', f.read(), re.MULTILINE)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    try:
+        from importlib.metadata import version          # Python 3.8+
+        return version(__name__)
+    except Exception:
+        pass
+    try:
+        import pkg_resources                            # Python 3.7 fallback
+        return pkg_resources.get_distribution(__name__).version
+    except Exception:
+        pass
+    return "0+unknown"
+
+
+__version__ = _find_version()
 
 _ENV = "PLOTTY"   # env var prefix (kept stable even if the file is renamed)
 
@@ -77,6 +107,7 @@ _cfg = {
     "close":  _env("CLOSE", "1") != "0",
     "size":   _env("SIZE", "60"),            # max display width in terminal cells
     "inline": False,                         # set in enable(): True when not in tmux
+    "can_display": True,                     # False -> no usable target; skip + warn
 }
 
 _cache = os.path.expanduser(_env("CACHE", "~/.cache/plotty"))
@@ -84,10 +115,15 @@ os.makedirs(_cache, exist_ok=True)
 _last = os.path.join(_cache, "last.png")
 _pidfile = os.path.join(_cache, "viewer.pid")
 
-_tmpdir = tempfile.mkdtemp(prefix="plotty-")
-_counter = itertools.count()
-_recent = []
-_KEEP = 8
+_warned = set()
+
+
+def _warn_once(key, msg):
+    """Print a warning to stderr once per topic (avoids per-cell noise in the
+    IPython hook when something is persistently broken)."""
+    if key not in _warned:
+        _warned.add(key)
+        print(f"[{__name__}] {msg}", file=sys.stderr)
 
 
 # ---- renderer detection -----------------------------------------------------
@@ -153,6 +189,47 @@ def _winsize(fd):
         return cs.columns, cs.lines, 0, 0
 
 
+def _parse_da1(resp):
+    """Parse a DA1 reply (ESC[?<attrs>c): True if attribute 4 (sixel) is
+    advertised, False if a reply lacks it, None if there is no parseable reply."""
+    m = re.search(rb"\[\?([\d;]*)c", resp)
+    if not m:
+        return None
+    return b"4" in m.group(1).split(b";")
+
+
+def _stdout_supports_sixel():
+    """Best-effort terminal sixel check via a DA1 query.
+
+    Returns False when stdout is not a terminal or the terminal's DA1 reply
+    lacks the sixel attribute (IDE consoles answer DA1 without it — dumping
+    raw sixel there just prints escape garbage). None means undeterminable.
+    """
+    try:
+        if not sys.stdout.isatty():
+            return False
+        if not sys.stdin.isatty():
+            return None                          # can't query without the tty
+        import termios
+        import tty as _tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        resp = b""
+        try:
+            _tty.setcbreak(fd)
+            sys.stdout.write("\x1b[c")           # DA1: "what are you?"
+            sys.stdout.flush()
+            while select.select([fd], [], [], 0.3)[0]:
+                resp += os.read(fd, 64)
+                if resp.rstrip().endswith(b"c"):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return _parse_da1(resp)
+    except Exception:
+        return None
+
+
 def _target_px_width(fd):
     """Target display width in pixels: `size` cells, capped to the pane width."""
     cols, rows, xpix, ypix = _winsize(fd)
@@ -212,9 +289,25 @@ def _make_box(pixels, ids):
 
 
 def _quantize(rgb, ncolors=256):
-    """Median-cut quantization. Returns (palette (K,3) uint8, indices (N,) int)."""
-    pixels = rgb.reshape(-1, 3)
-    boxes = [_make_box(pixels, np.arange(pixels.shape[0]))]
+    """Quantize to <=ncolors. Returns (palette (K,3) uint8, indices (N,) int).
+
+    Operates on the image's *distinct* colors (packed RGB ints) instead of raw
+    pixels: an exact, lossless palette when there are <=ncolors distinct colors,
+    else median-cut over the distinct colors weighted by pixel counts. Distinct
+    colors number in the hundreds even for anti-aliased plots (vs ~10^5 pixels),
+    so both paths are fast, and the weighted palette is identical to running
+    median-cut over the raw pixels.
+    """
+    pixels = rgb.reshape(-1, 3).astype(np.int32)
+    packed = (pixels[:, 0] << 16) | (pixels[:, 1] << 8) | pixels[:, 2]
+    uniq, inverse, counts = np.unique(packed, return_inverse=True,
+                                      return_counts=True)
+    inverse = inverse.reshape(-1).astype(np.int32)
+    colors = np.stack([(uniq >> 16) & 0xFF, (uniq >> 8) & 0xFF, uniq & 0xFF],
+                      axis=1).astype(np.uint8)
+    if colors.shape[0] <= ncolors:
+        return colors, inverse                   # exact palette, lossless
+    boxes = [_make_box(colors, np.arange(colors.shape[0]))]
     while len(boxes) < ncolors:
         si, best = -1, 0
         for i, (ids, rng, _) in enumerate(boxes):
@@ -223,16 +316,19 @@ def _quantize(rgb, ncolors=256):
         if si < 0 or best == 0:
             break                                # all boxes are single-colour
         ids, _, ch = boxes.pop(si)
-        ids = ids[np.argsort(pixels[ids, ch], kind="stable")]
-        mid = ids.size // 2
-        boxes.append(_make_box(pixels, ids[:mid]))
-        boxes.append(_make_box(pixels, ids[mid:]))
+        ids = ids[np.argsort(colors[ids, ch], kind="stable")]
+        cum = np.cumsum(counts[ids])             # split at the weighted median
+        mid = int(np.searchsorted(cum, cum[-1] / 2)) + 1
+        mid = min(max(mid, 1), ids.size - 1)
+        boxes.append(_make_box(colors, ids[:mid]))
+        boxes.append(_make_box(colors, ids[mid:]))
     palette = np.empty((len(boxes), 3), np.uint8)
-    indices = np.empty(pixels.shape[0], np.int32)
+    color_pal = np.empty(colors.shape[0], np.int32)
     for i, (ids, _, _) in enumerate(boxes):
-        palette[i] = pixels[ids].mean(axis=0).round().astype(np.uint8)
-        indices[ids] = i
-    return palette, indices
+        w = counts[ids].astype(np.float64)[:, None]
+        palette[i] = np.round((colors[ids] * w).sum(axis=0) / w.sum())
+        color_pal[ids] = i
+    return palette, color_pal[inverse]
 
 
 def _rle(codes):
@@ -303,7 +399,11 @@ def _render_bytes(path, fd):
 # ---- pane resolution --------------------------------------------------------
 
 def _resolve_pane(target):
-    """Negative ints index the current window's panes Python-style (-1 = last)."""
+    """Negative ints index the current window's panes Python-style (-1 = last).
+
+    The REPL's own pane ($TMUX_PANE) is excluded when other panes exist —
+    drawing into the pane the user is typing in is never what they want.
+    """
     try:
         idx = int(target)
     except (TypeError, ValueError):
@@ -314,11 +414,45 @@ def _resolve_pane(target):
         out = subprocess.run([_cfg["tmux"], "list-panes", "-F", "#{pane_id}"],
                              capture_output=True, text=True, check=False)
         ids = out.stdout.split()
+        own = os.environ.get("TMUX_PANE")
+        if len(ids) > 1 and own in ids:
+            ids.remove(own)
         if ids:
-            return ids[idx]                    # stable pane id (%N)
+            return ids[max(idx, -len(ids))]    # stable pane id (%N)
     except OSError:
         pass
     return str(target)
+
+
+def _ensure_separate_pane(target_pane, verbose):
+    """Resolve the target pane, creating one if the REPL's pane is the only one.
+
+    send-keys / sixel into the pane the user is typing in just injects garbage
+    into their console — if there is no separate pane, split one off; if that
+    fails, disable display and say so instead of typing into the REPL.
+    """
+    pane = _resolve_pane(target_pane)
+    own = os.environ.get("TMUX_PANE")
+    if not own or pane != own:
+        return pane
+    try:
+        out = subprocess.run([_cfg["tmux"], "split-window", "-d", "-h", "-t", own,
+                              "-P", "-F", "#{pane_id}"],
+                             capture_output=True, text=True, check=False)
+        new = out.stdout.strip()
+    except OSError:
+        new = ""
+    if new:
+        if verbose:
+            print(f"[{__name__}] no separate pane to draw into: created plot "
+                  f"pane {new} (tmux split-window)", file=sys.stderr)
+        return new
+    _cfg["can_display"] = False
+    if verbose:
+        print(f"[{__name__}] cannot display figures: this tmux window has no "
+              f"separate pane and creating one failed — split a pane "
+              f"(prefix+\") and re-run enable()", file=sys.stderr)
+    return pane
 
 
 # ---- talking to the viewer (or send-keys fallback) --------------------------
@@ -439,30 +573,35 @@ def _write_inline(path):
         print(f"[{__name__}] inline render failed: {exc}", file=sys.stderr)
 
 
-def _publish(src):
+def _publish(fig):
+    """Save the figure once, straight to last.png via temp-file + os.replace
+    (atomic hand-off: the viewer never sees a partial file). True on success."""
+    kw = {"format": "png", "bbox_inches": "tight"}
+    if _cfg["dpi"]:
+        try:
+            kw["dpi"] = float(_cfg["dpi"])
+        except (TypeError, ValueError):
+            _warn_once("dpi", f"ignoring invalid dpi {_cfg['dpi']!r}")
     tmp = _last + ".part"
     try:
-        shutil.copyfile(src, tmp)
+        fig.savefig(tmp, **kw)
         os.replace(tmp, _last)
-    except OSError:
-        pass
+        return True
+    except OSError as exc:
+        _warn_once("publish", f"cannot write {_last}: {exc}")
+        return False
 
 
 def _display_figure(fig):
-    path = os.path.join(_tmpdir, f"fig-{next(_counter):04d}.png")
-    kw = {"bbox_inches": "tight"}
-    if _cfg["dpi"]:
-        kw["dpi"] = int(_cfg["dpi"])
-    fig.savefig(path, **kw)
-    _recent.append(path)
-    while len(_recent) > _KEEP:
-        try:
-            os.remove(_recent.pop(0))
-        except OSError:
-            pass
-    _publish(path)
+    if not _cfg.get("can_display", True):
+        _warn_once("display", "figure not displayed — no usable display target "
+                              "(see the enable() warnings); fix it and re-run "
+                              "enable()")
+        return
+    if not _publish(fig):
+        return
     if _cfg["inline"]:
-        _write_inline(path)
+        _write_inline(_last)
     elif not _signal_viewer():
         _emit()
 
@@ -496,6 +635,8 @@ def show(*args, **kwargs):
 
 
 def redraw():
+    if not _cfg.get("can_display", True):
+        return
     if _cfg["inline"]:
         if os.path.exists(_last):
             _write_inline(_last)
@@ -565,8 +706,10 @@ def view():
         signal.set_wakeup_fd(wfd)                # kernel writes signal numbers here
         for sig in draw_sigs | quit_sigs:
             signal.signal(sig, lambda *_: None)  # neutralize default dispositions
-        with open(_pidfile, "w") as f:
+        tmp = _pidfile + ".part"
+        with open(tmp, "w") as f:
             f.write(str(os.getpid()))
+        os.replace(tmp, _pidfile)                # atomic, like last.png
         ok = _draw()
         while ok:
             sigs = set(os.read(rfd, 128))        # blocks: zero CPU while idle
@@ -653,9 +796,6 @@ def _health_check(verbose):
         where = "the target tmux pane" if intmux else "this terminal"
         print(f"[{name}] inline mode: piping sixel to {where} "
               f"(requires a sixel-capable terminal)", file=sys.stderr)
-    elif not intmux:
-        print(f"[{name}] inline mode is off but you are not in tmux; pane routing "
-              f"will not work — pass inline=True to enable()", file=sys.stderr)
     if intmux:                                   # both modes lean on tmux's sixel
         ver = _tmux_version()
         if ver is not None and ver < (3, 4):
@@ -740,13 +880,29 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     matplotlib.interactive(True)
 
     _cfg["inline"] = _resolve_inline(inline)
+    _cfg["can_display"] = True
+    intmux = os.environ.get("TMUX") is not None
+    if not intmux and not _cfg["inline"]:
+        if verbose:
+            print(f"[{__name__}] not inside tmux: viewer-pane mode is unavailable, "
+                  f"falling back to inline display", file=sys.stderr)
+        _cfg["inline"] = True
     _health_check(verbose)
     if _cfg["inline"]:
-        if os.environ.get("TMUX") is not None:
-            _cfg["pane"] = _resolve_pane(target_pane)   # pipe sixel to this pane's tty
+        if intmux:
+            # pipe sixel to a separate pane's tty (never the REPL's own pane)
+            _cfg["pane"] = _ensure_separate_pane(target_pane, verbose)
+        elif inline is not True:                 # auto-selected: verify the terminal
+            if _stdout_supports_sixel() is False:
+                _cfg["can_display"] = False
+                if verbose:
+                    print(f"[{__name__}] this terminal does not appear to support "
+                          f"sixel — figures will not be displayed (use a "
+                          f"sixel-capable terminal or tmux; enable(inline=True) "
+                          f"forces output anyway)", file=sys.stderr)
     else:
-        _cfg["pane"] = _resolve_pane(target_pane)
-        if viewer:
+        _cfg["pane"] = _ensure_separate_pane(target_pane, verbose)
+        if _cfg["can_display"] and viewer:
             _ensure_viewer()
     hook()
 
