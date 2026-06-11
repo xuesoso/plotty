@@ -1,6 +1,6 @@
 [project]
 name = "plotty"
-version = "1.0.1"
+version = "1.1.0"
 description = "Inline matplotlib plots in your terminal via sixel, in a tmux pane, over SSH"
 readme = "README.md"
 requires-python = ">=3.7"
