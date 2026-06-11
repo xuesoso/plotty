@@ -8,6 +8,7 @@ module-level paths (`_cache`, `_last`, `_pidfile`) never touch the real
 import os
 import sys
 import types
+import shutil
 import tempfile
 import pathlib
 
@@ -54,11 +55,13 @@ def fake_run(monkeypatch):
 def _isolate():
     """Snapshot/restore _cfg and clear stray cache files around each test."""
     snap = dict(plotty._cfg)
-    for path in (plotty._pidfile, plotty._last):
+    plotty._warned.clear()
+    for path in (plotty._pidfile, plotty._last, plotty._config):
         try:
             os.remove(path)
         except OSError:
             pass
+    shutil.rmtree(plotty._histdir, ignore_errors=True)
     yield
     plotty._cfg.clear()
     plotty._cfg.update(snap)
