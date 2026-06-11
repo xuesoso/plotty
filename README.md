@@ -6,7 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > Inline matplotlib plots in your terminal — rendered as **sixel** in a dedicated
-> tmux pane, **including over SSH**. No browser, no X11, no Jupyter server.
+> tmux pane, **including over SSH**. No browser, no X11, no Jupyter server —
+> and **zero dependencies** beyond matplotlib (the sixel encoder is built in).
 
 <p align="center">
   <img src="images/plotty_1.gif" alt="plotty demo" width="720">
@@ -50,7 +51,7 @@ covers three setups:
 | **Python** | ≥ 3.7 |
 | **tmux** | ≥ **3.4**, built with sixel support (`--enable-sixel`) |
 | **Terminal** | a sixel-capable terminal for display — e.g. WezTerm, foot, Konsole, `xterm -ti vt340` |
-| **Python deps** | `matplotlib` (and `numpy`, which ships with matplotlib) — that's all |
+| **Python deps** | `matplotlib` (and `numpy`, which ships with matplotlib) — **nothing else**: rendering uses plotty's built-in sixel encoder by default, no external tools |
 
 Check tmux:
 
@@ -85,8 +86,8 @@ uv pip install .
 
 ```python
 import plotty
-plotty.enable()                 # auto-detect a renderer, target the last tmux pane,
-                                # and spawn a tiny viewer there
+plotty.enable()                 # built-in sixel renderer, target the last tmux
+                                # pane, and spawn a tiny viewer there
 
 import matplotlib.pyplot as plt
 plt.plot([1, 4, 9, 16])
@@ -161,23 +162,29 @@ warns and skips display instead of printing escape garbage. An explicit
 
 ## Sixel encoders
 
-plotty ships with a **built-in, dependency-free sixel encoder** (pure stdlib +
-numpy), so it works out of the box with no external tools. It quantizes over the
-image's distinct colors — exact (lossless) when there are ≤256, fast
-count-weighted median-cut otherwise.
+By default plotty renders with its **built-in, dependency-free sixel encoder**
+(pure stdlib + numpy) — **zero external tools**, identical behavior on every
+machine. It quantizes over the image's distinct colors — exact (lossless) when
+there are ≤256, fast count-weighted median-cut otherwise — and renders a
+typical plot in ~50 ms.
 
-If one is on your `PATH`, plotty auto-detects an external encoder for
-higher-quality (dithered) output, in priority order:
-
-1. [`chafa`](https://github.com/hpjansson/chafa) — recommended
-2. [`img2sixel`](https://github.com/saitoha/libsixel) (libsixel)
-3. ImageMagick (`magick` / `convert`)
-
-Force the built-in encoder regardless of what's installed:
+If you want **slightly faster rendering and better resampling/dithering** (most
+visible on photos/`imshow` and heavy downscaling), point plotty at an external
+sixel encoder:
 
 ```python
-plotty.enable(imgcat="builtin")     # or:  PLOTTY_IMGCAT=builtin
+plotty.enable(imgcat="chafa")       # or "img2sixel", "magick"
+plotty.enable(imgcat="auto")        # first external tool found on PATH
+# PLOTTY_IMGCAT=chafa works too; a full custom command string is also accepted
 ```
+
+- [`chafa`](https://github.com/hpjansson/chafa)
+- [`img2sixel`](https://github.com/saitoha/libsixel) (libsixel)
+- ImageMagick (`magick` / `convert`)
+
+If the requested tool isn't installed, plotty warns and falls back to the
+built-in encoder. Note: the `bg` background option applies to the built-in
+encoder only.
 
 > plotty is **sixel-only** by design — sixel is the only path that survives tmux
 > and SSH. Non-sixel terminal-image protocols (kitty / iTerm) are not used. A
@@ -232,7 +239,7 @@ Both tmux layers must be ≥ 3.4 and built with sixel.
 | `target_pane` | `PLOTTY_PANE` | `-1` | tmux pane for the plot; negative indexes from the end (`-1` = last) |
 | `size` | `PLOTTY_SIZE` | `60` | display width in terminal cells |
 | `dpi` | `PLOTTY_DPI` | matplotlib default | `savefig` DPI of the source image (raise it for sharper plots at large `size`) |
-| `imgcat` | `PLOTTY_IMGCAT` | auto | renderer command; `"builtin"` forces the built-in encoder |
+| `imgcat` | `PLOTTY_IMGCAT` | built-in encoder | `"chafa"`/`"img2sixel"`/`"magick"` for that tool, `"auto"` to detect one, or a custom command |
 | `bg` | `PLOTTY_BG` | white | `#rrggbb` background composited under transparent figure regions (match your terminal for dark themes) |
 | `hist` | `PLOTTY_HIST` | `10` | recent figures kept for the viewer's history keys (`0` disables) |
 | `inline` | `PLOTTY_INLINE` | auto | `True`/`False` to force inline vs viewer-pane mode |

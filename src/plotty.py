@@ -11,10 +11,12 @@ bytes cross SSH, so it works the same locally and over a remote session.
     plotty.enable(target_pane=2)         # or pick a pane explicitly
     plotty.disable()                     # stop the viewer + auto-display
 
-Renderer auto-detection is sixel-only (the SSH-robust path): chafa, img2sixel,
-ImageMagick. If none is on PATH it falls back to a built-in, dependency-free
-sixel encoder (stdlib + numpy, which ships with matplotlib). A non-sixel command
-may be passed explicitly as imgcat= but warns that it may not work over SSH.
+Rendering uses the built-in, dependency-free sixel encoder by default (stdlib +
+numpy, which ships with matplotlib) — no external tools needed. Opt into an
+external sixel encoder with enable(imgcat="chafa") / "img2sixel" / "magick"
+(slightly faster, better resampling), imgcat="auto" to pick the first one on
+PATH, or pass a full custom command. A non-sixel command warns that it may not
+work over SSH.
 
 Display modes: a viewer process running in a tmux pane (default in tmux), or
 "inline" mode which renders sixel itself (no viewer) and writes it to the target
@@ -85,9 +87,10 @@ __version__ = _find_version()
 
 _ENV = "PLOTTY"   # env var prefix (kept stable even if the file is renamed)
 
-# Sixel renderer candidates, in priority order (first one found on PATH wins).
-# Sixel is the only SSH-robust path, so non-sixel protocols (kitty/iTerm) are
-# intentionally excluded. Placeholders are substituted at render time:
+# External sixel renderer candidates (opt-in: imgcat="auto" picks the first on
+# PATH; a bare tool name like imgcat="chafa" selects its template). Sixel is the
+# only SSH-robust path, so non-sixel protocols (kitty/iTerm) are intentionally
+# excluded. Placeholders are substituted at render time:
 #   "{}"      -> the image path (else it's appended)
 #   "{size}"  -> display width in terminal cells  (_cfg["size"])
 #   "{width}" -> display width in pixels          (size cells * pane cell width)
@@ -179,6 +182,14 @@ def _auto_imgcat():
     """Return the first renderer command available on PATH, else None."""
     for cmd in _CANDIDATES:
         if shutil.which(shlex.split(cmd)[0]):
+            return cmd
+    return None
+
+
+def _renderer_for(name):
+    """The candidate template whose program is exactly `name`, or None."""
+    for cmd in _CANDIDATES:
+        if shlex.split(cmd)[0] == name:
             return cmd
     return None
 
@@ -995,20 +1006,32 @@ def _resolve_inline(inline):
 def _resolve_imgcat(imgcat, verbose):
     """Resolve the renderer command, where None means the built-in encoder.
 
-    imgcat=None consults PLOTTY_IMGCAT then auto-detects; "" / "builtin" / False
-    force the built-in encoder; any other string is used as the command.
+    The default (imgcat=None, no PLOTTY_IMGCAT) is the built-in, dependency-free
+    encoder. "chafa"/"img2sixel"/"magick"/"convert" select that external tool
+    (warning + built-in fallback if it isn't installed), "auto" picks the first
+    external tool found on PATH, "" / "builtin" / False force the built-in, and
+    any other string is used as a custom command.
     """
     if imgcat is None:
         imgcat = _env("IMGCAT", None)
-    if imgcat in ("", "builtin", False):
-        return None
-    if imgcat is None:                           # auto-detect an external renderer
+    if imgcat in (None, "", "builtin", False):
+        return None                              # built-in encoder (the default)
+    if imgcat == "auto":
         imgcat = _auto_imgcat()
-        if imgcat is None and verbose:
-            print(f"[{__name__}] no external renderer on PATH; using built-in "
-                  f"sixel encoder (install chafa for higher-quality output)",
-                  file=sys.stderr)
-    if imgcat and verbose and not _is_sixel(imgcat):
+        if imgcat is None:
+            if verbose:
+                print(f"[{__name__}] no external renderer on PATH; using the "
+                      f"built-in sixel encoder", file=sys.stderr)
+            return None
+    elif _renderer_for(imgcat):                  # bare tool name, e.g. "chafa"
+        if shutil.which(imgcat):
+            imgcat = _renderer_for(imgcat)
+        else:
+            if verbose:
+                print(f"[{__name__}] {imgcat} not found on PATH; using the "
+                      f"built-in sixel encoder", file=sys.stderr)
+            return None
+    if verbose and not _is_sixel(imgcat):
         print(f"[{__name__}] {shlex.split(imgcat)[0]} is not sixel, so image "
               f"display may not work over ssh", file=sys.stderr)
     return imgcat
@@ -1025,12 +1048,12 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     terminal's stdout when not. inline=True forces inline even inside tmux;
     inline=False forces viewer-pane mode. `PLOTTY_INLINE=1/0` sets the default.
 
-    imgcat=None (default) auto-detects an external renderer (chafa/img2sixel/
-    magick), falling back to the built-in encoder if none is found. Pass
-    imgcat="builtin" (or "" / False) to force the built-in encoder even when an
-    external one is installed; pass a command string to use it explicitly.
-    `PLOTTY_IMGCAT` sets the default (`PLOTTY_IMGCAT=builtin` forces built-in).
-    This applies to both viewer and inline modes.
+    imgcat=None (default) uses the built-in, dependency-free sixel encoder.
+    Pass imgcat="chafa" / "img2sixel" / "magick" to use that external tool
+    (slightly faster, better resampling; falls back to built-in with a warning
+    if it isn't installed), imgcat="auto" to pick the first external tool on
+    PATH, or a full command string to use it verbatim. `PLOTTY_IMGCAT` sets the
+    default. This applies to both viewer and inline modes.
 
     size (display width in cells, default 60) and dpi (matplotlib savefig DPI;
     None = matplotlib's own default) control display size and source-image

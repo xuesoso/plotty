@@ -487,10 +487,42 @@ def test_enable_force_builtin_via_env(monkeypatch, fake_run):
     assert plotty._cfg["imgcat"] is None
 
 
-def test_enable_explicit_external_renderer(monkeypatch, fake_run):
+def test_enable_default_is_builtin_even_with_tools_installed(monkeypatch, fake_run):
     monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.delenv("PLOTTY_IMGCAT", raising=False)
+    monkeypatch.setattr(plotty.shutil, "which", lambda c: f"/usr/bin/{c}")
+    plotty.enable(viewer=False, verbose=0)        # no imgcat, chafa "installed"
+    assert plotty._cfg["imgcat"] is None          # built-in is the default
+
+
+def test_enable_imgcat_auto_detects_external(monkeypatch, fake_run):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.setattr(plotty.shutil, "which", lambda c: f"/usr/bin/{c}")
+    plotty.enable(imgcat="auto", viewer=False, verbose=0)
+    assert plotty._cfg["imgcat"] == plotty._CANDIDATES[0]   # first on PATH wins
+
+
+def test_enable_imgcat_shorthand_resolves_template(monkeypatch, fake_run):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.setattr(plotty.shutil, "which", lambda c: f"/usr/bin/{c}")
     plotty.enable(imgcat="img2sixel", viewer=False, verbose=0)
-    assert plotty._cfg["imgcat"] == "img2sixel"
+    assert plotty._cfg["imgcat"] == "img2sixel -w {width}"
+    plotty.enable(imgcat="chafa", viewer=False, verbose=0)
+    assert plotty._cfg["imgcat"] == "chafa -f sixels --size {size}"
+
+
+def test_enable_imgcat_shorthand_missing_tool_falls_back(monkeypatch, fake_run, capsys):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.setattr(plotty.shutil, "which", lambda c: None)
+    plotty.enable(imgcat="chafa", viewer=False, verbose=1)
+    assert plotty._cfg["imgcat"] is None          # built-in fallback
+    assert "not found on PATH" in capsys.readouterr().err
+
+
+def test_enable_imgcat_custom_command_passthrough(monkeypatch, fake_run):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    plotty.enable(imgcat="img2sixel -w 500 -d atkinson", viewer=False, verbose=0)
+    assert plotty._cfg["imgcat"] == "img2sixel -w 500 -d atkinson"
 
 
 def test_display_figure_uses_dpi(monkeypatch):
