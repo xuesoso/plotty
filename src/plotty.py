@@ -30,12 +30,17 @@ derived from the module name automatically.
 
 Config via env vars (optional; enable() args override): PLOTTY_PANE,
 PLOTTY_IMGCAT, PLOTTY_CLEAR, PLOTTY_TMUX, PLOTTY_DPI, PLOTTY_CLOSE, PLOTTY_CACHE,
-PLOTTY_SIZE, PLOTTY_INLINE.
+PLOTTY_SIZE, PLOTTY_INLINE, PLOTTY_BG, PLOTTY_HIST.
+
+In the viewer pane: p/k = previous figure, n/j = next, q = quit. Re-running
+enable() with new settings updates a running viewer live.
 """
 
 import os
 import re
 import sys
+import json
+import time
 import select
 import signal
 import shlex
@@ -106,14 +111,19 @@ _cfg = {
     "dpi":    _env("DPI", None),
     "close":  _env("CLOSE", "1") != "0",
     "size":   _env("SIZE", "60"),            # max display width in terminal cells
+    "bg":     _env("BG", None),              # '#rrggbb' alpha-composite background
+    "hist":   _env("HIST", "10"),            # figures kept for viewer history keys
     "inline": False,                         # set in enable(): True when not in tmux
     "can_display": True,                     # False -> no usable target; skip + warn
+    "made_pane": None,                       # pane id enable() auto-split, if any
 }
 
 _cache = os.path.expanduser(_env("CACHE", "~/.cache/plotty"))
 os.makedirs(_cache, exist_ok=True)
 _last = os.path.join(_cache, "last.png")
 _pidfile = os.path.join(_cache, "viewer.pid")
+_config = os.path.join(_cache, "config.json")
+_histdir = os.path.join(_cache, "hist")
 
 _warned = set()
 
@@ -124,6 +134,39 @@ def _warn_once(key, msg):
     if key not in _warned:
         _warned.add(key)
         print(f"[{__name__}] {msg}", file=sys.stderr)
+
+
+def _write_config():
+    """Publish the live display settings for the viewer.
+
+    The viewer re-reads this on every draw, so re-running enable(size=...,
+    bg=..., imgcat=...) takes effect on the next figure without a restart."""
+    data = {"imgcat": _cfg["imgcat"], "size": _cfg["size"],
+            "clear": _cfg["clear"], "bg": _cfg["bg"]}
+    tmp = _config + ".part"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _config)
+    except OSError:
+        pass
+
+
+def _load_settings():
+    """Viewer/--render side: env vars bootstrap, then config.json (live
+    updates from the backend) takes precedence."""
+    _cfg["imgcat"] = _env("IMGCAT", "") or None      # empty -> built-in encoder
+    _cfg["size"] = _env("SIZE", _cfg["size"])
+    _cfg["clear"] = _env("CLEAR", "1" if _cfg["clear"] else "0") != "0"
+    _cfg["bg"] = _env("BG", _cfg.get("bg"))
+    try:
+        with open(_config) as f:
+            data = json.load(f)
+        for key in ("imgcat", "size", "clear", "bg"):
+            if key in data:
+                _cfg[key] = data[key]
+    except (OSError, ValueError):
+        pass
 
 
 # ---- renderer detection -----------------------------------------------------
@@ -255,8 +298,21 @@ def _target_size(fd, w, h):
     return max(1, round(w * scale)), max(1, round(h * scale))
 
 
+def _parse_bg(value):
+    """'#rrggbb' (or 'rrggbb') -> (r, g, b); None/invalid -> white."""
+    if not value:
+        return (255, 255, 255)
+    v = str(value).lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", v):
+        return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+    _warn_once("bg", f"ignoring invalid bg {value!r} (use '#rrggbb')")
+    return (255, 255, 255)
+
+
 def _load_rgb(path):
-    """Read a PNG into an (H, W, 3) uint8 array, compositing alpha over white."""
+    """Read a PNG into an (H, W, 3) uint8 array, compositing alpha over the
+    configured background color (white by default; PLOTTY_BG / enable(bg=...)
+    for dark terminals)."""
     a = mpimg.imread(path)                       # matplotlib reads PNG w/o Pillow
     if a.ndim == 2:
         a = np.stack([a] * 3, axis=-1)
@@ -265,9 +321,10 @@ def _load_rgb(path):
     else:
         a = a.astype(np.uint8)
     if a.shape[2] == 4:
+        bg = np.array(_parse_bg(_cfg.get("bg")), np.float32)
         alpha = a[..., 3:4].astype(np.float32) / 255.0
         rgb = a[..., :3].astype(np.float32)
-        a = (rgb * alpha + 255.0 * (1.0 - alpha)).round().astype(np.uint8)
+        a = (rgb * alpha + bg * (1.0 - alpha)).round().astype(np.uint8)
     return np.ascontiguousarray(a[..., :3])
 
 
@@ -443,6 +500,7 @@ def _ensure_separate_pane(target_pane, verbose):
     except OSError:
         new = ""
     if new:
+        _cfg["made_pane"] = new                  # remember: disable(close_pane=True)
         if verbose:
             print(f"[{__name__}] no separate pane to draw into: created plot "
                   f"pane {new} (tmux split-window)", file=sys.stderr)
@@ -460,8 +518,18 @@ def _ensure_separate_pane(target_pane, verbose):
 def _read_pid():
     try:
         with open(_pidfile) as f:
-            return int(f.read().strip())
+            return int(f.readline().strip())
     except (OSError, ValueError):
+        return None
+
+
+def _read_viewer_pane():
+    """The tmux pane the viewer runs in (line 2 of the pidfile), or None."""
+    try:
+        with open(_pidfile) as f:
+            f.readline()
+            return f.readline().strip() or None
+    except OSError:
         return None
 
 
@@ -573,6 +641,42 @@ def _write_inline(path):
         print(f"[{__name__}] inline render failed: {exc}", file=sys.stderr)
 
 
+def _hist_files():
+    """History snapshots, newest first (index 0 == the current figure)."""
+    try:
+        names = sorted(os.listdir(_histdir), reverse=True)
+    except OSError:
+        return []
+    return [os.path.join(_histdir, n) for n in names if n.endswith(".png")]
+
+
+def _record_history():
+    """Snapshot the just-published last.png into the history ring and prune.
+
+    Uses a hardlink (free): os.replace on the next publish unlinks last.png's
+    name from the old inode, so the snapshot keeps the old bytes alive."""
+    try:
+        keep = int(_cfg.get("hist") or 0)
+    except (TypeError, ValueError):
+        keep = 10
+    if keep <= 0:
+        return
+    try:
+        os.makedirs(_histdir, exist_ok=True)
+        name = os.path.join(_histdir, f"fig-{time.time_ns():020d}.png")
+        try:
+            os.link(_last, name)
+        except OSError:
+            shutil.copyfile(_last, name)
+        for old in _hist_files()[keep:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _publish(fig):
     """Save the figure once, straight to last.png via temp-file + os.replace
     (atomic hand-off: the viewer never sees a partial file). True on success."""
@@ -586,10 +690,11 @@ def _publish(fig):
     try:
         fig.savefig(tmp, **kw)
         os.replace(tmp, _last)
-        return True
     except OSError as exc:
         _warn_once("publish", f"cannot write {_last}: {exc}")
         return False
+    _record_history()
+    return True
 
 
 def _display_figure(fig):
@@ -624,7 +729,15 @@ def draw_if_interactive():
     pass
 
 
-def show(*args, **kwargs):
+def show(fig=None, *args, **kwargs):
+    """Display pyplot-managed figures, or an explicit Figure passed as `fig`.
+
+    Passing a figure covers non-pyplot figures (matplotlib.figure.Figure built
+    directly), which never register with pyplot and would otherwise not show.
+    Such figures are not auto-closed."""
+    if fig is not None:
+        _display_figure(fig)
+        return
     managers = Gcf.get_all_fig_managers()
     if not managers:
         return
@@ -632,6 +745,15 @@ def show(*args, **kwargs):
         _display_figure(manager.canvas.figure)
     if _cfg["close"]:
         Gcf.destroy_all()
+
+
+def save(path):
+    """Copy the most recently displayed figure (full-resolution PNG) to path."""
+    if not os.path.exists(_last):
+        raise FileNotFoundError("plotty has not displayed a figure yet")
+    dst = os.path.expanduser(path)
+    shutil.copyfile(_last, dst)
+    return dst
 
 
 def redraw():
@@ -646,15 +768,10 @@ def redraw():
 
 # ---- the viewer (runs in the plot pane) -------------------------------------
 
-def _apply_env():
-    """Load renderer settings from the environment (for the --view/--render subprocesses)."""
-    _cfg["imgcat"] = _env("IMGCAT", "") or None      # empty -> built-in encoder
-    _cfg["size"] = _env("SIZE", _cfg["size"])
-
-
 def view():
-    """Viewer loop: redraw last.png on SIGUSR1 (new figure) / SIGWINCH (resize),
-    exit on SIGTERM/SIGINT/SIGHUP.
+    """Viewer loop: redraw on SIGUSR1 (new figure) / SIGWINCH (resize), exit on
+    SIGTERM/SIGINT/SIGHUP. When the pane tty is interactive, single keys
+    navigate figure history: p/k = older, n/j = newer, q = quit.
 
     Signal handlers do no work — the kernel writes the signal number to a
     self-pipe (signal.set_wakeup_fd) and all rendering/writing happens in the
@@ -663,36 +780,57 @@ def view():
     os._exit(0): an abnormal viewer exit (traceback or fatal signal) makes
     macOS pop a "Python quit unexpectedly" crash dialog when the surrounding
     session is torn down. Draining the pipe for ~50 ms also coalesces signal
-    bursts, so a resize storm redraws once.
+    bursts, so a resize storm redraws once. Display settings are re-read from
+    config.json on every draw, so enable(...) changes apply live.
     """
-    _apply_env()
-    clear = _env("CLEAR", "1" if _cfg["clear"] else "0") != "0"
+    _load_settings()
 
     draw_sigs = {int(getattr(signal, n)) for n in ("SIGUSR1", "SIGWINCH")
                  if hasattr(signal, n)}
     quit_sigs = {int(getattr(signal, n)) for n in ("SIGTERM", "SIGINT", "SIGHUP")
                  if hasattr(signal, n)}
+    usr1 = int(getattr(signal, "SIGUSR1", -1))
+    kb_fd = kb_old = None
+    offset = 0                                   # 0 = live; k > 0 = k figures back
 
     def _cleanup():
+        if kb_old is not None:
+            try:
+                import termios
+                termios.tcsetattr(kb_fd, termios.TCSADRAIN, kb_old)
+            except Exception:
+                pass
         try:
             if _read_pid() == os.getpid():
                 os.remove(_pidfile)
         except OSError:
             pass
 
-    def _draw():
-        """Render last.png to stdout. False means the tty is gone: exit."""
-        if not os.path.exists(_last):
+    def _current():
+        """(path, status note) for the figure the viewer should show."""
+        if offset <= 0:
+            return _last, ""
+        files = _hist_files()
+        if offset >= len(files):
+            return _last, ""
+        return files[offset], f"[{offset}/{len(files) - 1}] n=newer p=older q=quit"
+
+    def _draw(path, note=""):
+        """Render `path` to stdout. False means the tty is gone: exit."""
+        if not path or not os.path.exists(path):
             return True
+        _load_settings()                         # live size/bg/clear/renderer
         try:
-            data = _render_bytes(_last, _out_fd())
+            data = _render_bytes(path, _out_fd())
         except Exception:
             return True                          # bad/partial image: skip frame
         try:
             out = sys.stdout.buffer
-            if clear:
+            if _cfg["clear"]:
                 out.write(b"\x1b[H\x1b[2J")      # home + clear screen
             out.write(data)
+            if note:
+                out.write(b"\r\n" + note.encode())
             out.flush()
             return True
         except OSError:                          # EPIPE/EIO: pane is gone
@@ -706,19 +844,44 @@ def view():
         signal.set_wakeup_fd(wfd)                # kernel writes signal numbers here
         for sig in draw_sigs | quit_sigs:
             signal.signal(sig, lambda *_: None)  # neutralize default dispositions
+        try:
+            if sys.stdin.isatty():               # single-key history navigation
+                import termios
+                import tty as _tty
+                kb_fd = sys.stdin.fileno()
+                kb_old = termios.tcgetattr(kb_fd)
+                _tty.setcbreak(kb_fd)
+        except Exception:
+            kb_fd = kb_old = None
         tmp = _pidfile + ".part"
-        with open(tmp, "w") as f:
-            f.write(str(os.getpid()))
+        with open(tmp, "w") as f:                # pid + the pane we live in
+            f.write(f"{os.getpid()}\n{os.environ.get('TMUX_PANE', '')}\n")
         os.replace(tmp, _pidfile)                # atomic, like last.png
-        ok = _draw()
+        fds = [rfd] + ([kb_fd] if kb_fd is not None else [])
+        ok = _draw(*_current())
         while ok:
-            sigs = set(os.read(rfd, 128))        # blocks: zero CPU while idle
-            while select.select([rfd], [], [], 0.05)[0]:
-                sigs |= set(os.read(rfd, 128))   # coalesce resize/figure bursts
-            if sigs & quit_sigs:
+            ready = select.select(fds, [], [])[0]    # blocks: zero CPU idle
+            sigs, keys = set(), b""
+            if rfd in ready:
+                sigs = set(os.read(rfd, 128))
+                while select.select([rfd], [], [], 0.05)[0]:
+                    sigs |= set(os.read(rfd, 128))   # coalesce signal bursts
+            if kb_fd is not None and kb_fd in ready:
+                keys = os.read(kb_fd, 16)
+            if (sigs & quit_sigs) or b"q" in keys:
                 break
-            if sigs & draw_sigs:
-                ok = _draw()
+            redraw = bool(sigs & draw_sigs)
+            if usr1 in sigs:
+                offset = 0                       # new figure: jump back to live
+            for key in keys:
+                if key in (ord("p"), ord("k")):      # older
+                    offset = min(offset + 1, max(len(_hist_files()) - 1, 0))
+                    redraw = True
+                elif key in (ord("n"), ord("j")):    # newer
+                    offset = max(offset - 1, 0)
+                    redraw = True
+            if redraw:
+                ok = _draw(*_current())
     except BaseException:
         pass                                     # never crash out of the viewer
     _cleanup()
@@ -730,7 +893,13 @@ def view():
 def _ensure_viewer():
     pid = _read_pid()
     if _alive(pid) and _is_viewer(pid):      # don't trust recycled pids
-        return
+        vpane = _read_viewer_pane()
+        if not vpane or vpane == str(_cfg["pane"]):
+            return                           # already in the right pane
+        try:
+            os.kill(pid, signal.SIGTERM)     # target moved: restart it there
+        except OSError:
+            pass
     # Always pass IMGCAT (empty == built-in) so the viewer's renderer matches the
     # backend's, regardless of any PLOTTY_IMGCAT inherited by the pane's shell.
     parts = [
@@ -846,7 +1015,8 @@ def _resolve_imgcat(imgcat, verbose):
 
 
 def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
-           close=True, size=None, inline=None, viewer=True, verbose=1):
+           close=True, size=None, bg=None, hist=None, inline=None, viewer=True,
+           verbose=1):
     """Activate plotty: detect a renderer, point at a pane, start the viewer.
 
     inline=None (default) auto-selects: inline mode when not in tmux, viewer-pane
@@ -867,14 +1037,27 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     resolution respectively. Both fall back to `PLOTTY_SIZE` / `PLOTTY_DPI` when
     the argument is None. Raise dpi when displaying at a large size so the source
     PNG has enough pixels to stay sharp (else the renderer upscales it).
+
+    bg ('#rrggbb', default white; `PLOTTY_BG`) is the background that transparent
+    figure regions are composited over by the built-in encoder — set it to your
+    terminal's background for dark setups. hist (default 10; `PLOTTY_HIST`) is
+    how many recent figures are kept for the viewer's history keys (p/n).
+
+    Settings are also published to the cache config, so re-running enable()
+    with new values updates a running viewer live (a changed target_pane
+    restarts it in the new pane).
     """
     _cfg["tmux"] = tmux
     _cfg["clear"] = clear
     _cfg["dpi"] = _env("DPI", None) if dpi is None else dpi
     _cfg["close"] = close
     _cfg["size"] = _env("SIZE", 60) if size is None else size
+    _cfg["bg"] = _env("BG", None) if bg is None else bg
+    _cfg["hist"] = _env("HIST", "10") if hist is None else hist
+    _cfg["made_pane"] = None
 
     _cfg["imgcat"] = _resolve_imgcat(imgcat, verbose)
+    _write_config()                              # viewer re-reads this per draw
 
     matplotlib.use(f"module://{__name__}")
     matplotlib.interactive(True)
@@ -907,14 +1090,21 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     hook()
 
 
-def disable():
-    """Stop the viewer, unhook auto-display, and quiet matplotlib output."""
+def disable(close_pane=False, verbose=1):
+    """Stop the viewer, unhook auto-display, and quiet matplotlib output.
+
+    close_pane=True also closes the plot pane — but only if enable() created
+    it via auto-split (a pane the user made themselves is never touched)."""
     pid = _read_pid()
     if _alive(pid) and _is_viewer(pid):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+    if close_pane and _cfg.get("made_pane"):
+        subprocess.run([_cfg["tmux"], "kill-pane", "-t", _cfg["made_pane"]],
+                       capture_output=True, check=False)
+        _cfg["made_pane"] = None
     global _hook_cb
     if _hook_cb is not None:
         try:
@@ -926,6 +1116,48 @@ def disable():
         matplotlib.use("agg")
     except Exception:
         pass
+    if verbose:
+        print(f"[{__name__}] disabled — figures will no longer be displayed "
+              f"(matplotlib backend: agg)", file=sys.stderr)
+
+
+def status():
+    """Print a one-call diagnostic summary of plotty's current state."""
+    intmux = os.environ.get("TMUX") is not None
+    if not _cfg.get("can_display", True):
+        mode = "DISABLED (no usable display target — see enable() warnings)"
+    elif _cfg["inline"]:
+        target = f"tmux pane {_cfg['pane']}" if intmux else "stdout"
+        mode = f"inline -> {target}"
+    else:
+        mode = f"viewer pane {_cfg['pane']}"
+    pid = _read_pid()
+    if _alive(pid) and _is_viewer(pid):
+        viewer = f"running (pid {pid}, pane {_read_viewer_pane() or '?'})"
+    else:
+        viewer = "not running"
+    try:
+        st = os.stat(_last)
+        last = time.strftime("%H:%M:%S", time.localtime(st.st_mtime)) \
+            + f" ({st.st_size} bytes)"
+    except OSError:
+        last = "never"
+    lines = [
+        f"plotty {__version__}",
+        f"  mode:      {mode}",
+        f"  renderer:  {_cfg['imgcat'] or 'built-in sixel encoder'}",
+        f"  size:      {_cfg['size']} cells   dpi: {_cfg['dpi'] or 'default'}   "
+        f"bg: {_cfg.get('bg') or 'white'}",
+        f"  viewer:    {viewer}",
+        f"  last fig:  {last}   history: {len(_hist_files())} kept",
+        f"  cache:     {_cache}",
+    ]
+    if intmux:
+        ver = _tmux_version()
+        feats = _tmux_features() or ""
+        lines.append(f"  tmux:      {'.'.join(map(str, ver)) if ver else '?'}   "
+                     f"sixel feature: {'yes' if 'sixel' in feats else 'not reported'}")
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":
@@ -933,7 +1165,7 @@ if __name__ == "__main__":
         view()
     elif "--render" in sys.argv:
         # render last.png to this pane's stdout (send-keys fallback)
-        _apply_env()
+        _load_settings()
         if os.path.exists(_last):
             sys.stdout.buffer.write(_render_bytes(_last, _out_fd()))
             sys.stdout.buffer.flush()

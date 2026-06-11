@@ -8,6 +8,147 @@ import pathlib
 import plotty
 
 
+# ---- live settings (config.json) ---------------------------------------------
+
+def test_write_config_load_settings_roundtrip(monkeypatch):
+    for var in ("PLOTTY_IMGCAT", "PLOTTY_SIZE", "PLOTTY_CLEAR", "PLOTTY_BG"):
+        monkeypatch.delenv(var, raising=False)
+    plotty._cfg.update(imgcat="chafa --size {size}", size=42, clear=False,
+                       bg="#101010")
+    plotty._write_config()
+    plotty._cfg.update(imgcat=None, size=60, clear=True, bg=None)  # drift
+    plotty._load_settings()                       # viewer-side reload
+    assert plotty._cfg["imgcat"] == "chafa --size {size}"
+    assert plotty._cfg["size"] == 42
+    assert plotty._cfg["clear"] is False
+    assert plotty._cfg["bg"] == "#101010"
+
+
+def test_load_settings_env_only_when_no_config(monkeypatch):
+    monkeypatch.setenv("PLOTTY_IMGCAT", "")
+    monkeypatch.setenv("PLOTTY_SIZE", "33")
+    plotty._load_settings()                       # no config.json present
+    assert plotty._cfg["imgcat"] is None          # "" -> built-in
+    assert plotty._cfg["size"] == "33"
+
+
+# ---- figure history ------------------------------------------------------------
+
+def _publish_n(n, monkeypatch):
+    monkeypatch.setattr(plotty, "_signal_viewer", lambda: True)
+
+    class FakeFig:
+        def savefig(self, path, **kw):
+            with open(path, "wb") as f:
+                f.write(os.urandom(8))
+
+    plotty._cfg.update(dpi=None, inline=False)
+    for _ in range(n):
+        plotty._display_figure(FakeFig())
+
+
+def test_history_records_and_prunes(monkeypatch):
+    plotty._cfg["hist"] = 2
+    _publish_n(3, monkeypatch)
+    files = plotty._hist_files()
+    assert len(files) == 2                        # pruned to the ring size
+    assert files == sorted(files, reverse=True)   # newest first
+    # newest snapshot has the same content as last.png
+    assert open(files[0], "rb").read() == open(plotty._last, "rb").read()
+
+
+def test_history_disabled_when_zero(monkeypatch):
+    plotty._cfg["hist"] = 0
+    _publish_n(2, monkeypatch)
+    assert plotty._hist_files() == []
+
+
+# ---- viewer pane tracking / restart-on-move ------------------------------------
+
+def test_read_viewer_pane():
+    with open(plotty._pidfile, "w") as f:
+        f.write("12345\n%9\n")
+    assert plotty._read_pid() == 12345
+    assert plotty._read_viewer_pane() == "%9"
+
+
+def test_ensure_viewer_restarts_when_pane_moved(fake_run, monkeypatch):
+    fake_run.responses = {"ps -p": "python /x/plotty.py --view\n"}
+    killed = []
+
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+        if sig == 0:
+            return
+    monkeypatch.setattr(plotty.os, "kill", fake_kill)
+    with open(plotty._pidfile, "w") as f:
+        f.write(f"{os.getpid()}\n%3\n")           # viewer lives in %3
+    plotty._cfg.update(imgcat=None, pane="%9", size=60, tmux="tmux")
+    plotty._ensure_viewer()                       # target is %9 now
+    assert (os.getpid(), signal.SIGTERM) in killed
+    assert any("send-keys" in " ".join(c) for c in fake_run.calls)
+
+
+def test_ensure_viewer_keeps_viewer_in_same_pane(fake_run, monkeypatch):
+    fake_run.responses = {"ps -p": "python /x/plotty.py --view\n"}
+    monkeypatch.setattr(plotty.os, "kill", lambda pid, sig: None)
+    with open(plotty._pidfile, "w") as f:
+        f.write(f"{os.getpid()}\n%9\n")
+    plotty._cfg.update(imgcat=None, pane="%9", size=60, tmux="tmux")
+    plotty._ensure_viewer()
+    assert not any("send-keys" in " ".join(c) for c in fake_run.calls)
+
+
+# ---- status / disable / show / save --------------------------------------------
+
+def test_status_prints_summary(monkeypatch, capsys, fake_run):
+    monkeypatch.delenv("TMUX", raising=False)
+    plotty._cfg.update(inline=True, can_display=True, imgcat=None, size=60,
+                       dpi=None, bg=None)
+    plotty.status()
+    out = capsys.readouterr().out
+    assert "mode:" in out and "inline -> stdout" in out
+    assert "built-in sixel encoder" in out
+    assert "viewer:    not running" in out
+    assert plotty.__version__ in out
+
+
+def test_disable_closes_auto_created_pane(fake_run, capsys):
+    plotty._cfg.update(made_pane="%7", tmux="tmux")
+    plotty.disable(close_pane=True, verbose=1)
+    assert any(c[:3] == ["tmux", "kill-pane", "-t"] and c[3] == "%7"
+               for c in fake_run.calls)
+    assert plotty._cfg["made_pane"] is None
+    assert "disabled" in capsys.readouterr().err
+
+
+def test_disable_leaves_user_panes_alone(fake_run):
+    plotty._cfg.update(made_pane=None, tmux="tmux")
+    plotty.disable(close_pane=True, verbose=0)
+    assert not any("kill-pane" in " ".join(c) for c in fake_run.calls)
+
+
+def test_show_explicit_figure(monkeypatch):
+    shown = []
+    monkeypatch.setattr(plotty, "_display_figure", lambda f: shown.append(f))
+    sentinel = object()
+    plotty.show(sentinel)                          # non-pyplot figure
+    assert shown == [sentinel]
+
+
+def test_save_copies_last_png(tmp_path):
+    with open(plotty._last, "wb") as f:
+        f.write(b"PNGDATA")
+    dst = plotty.save(str(tmp_path / "out.png"))
+    assert open(dst, "rb").read() == b"PNGDATA"
+
+
+def test_save_raises_without_figure(tmp_path):
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        plotty.save(str(tmp_path / "out.png"))
+
+
 # ---- __version__ --------------------------------------------------------------
 
 def test_version_matches_pyproject():
@@ -41,13 +182,6 @@ def test_enable_warns_on_non_sixel_imgcat(monkeypatch, capsys):
 
 
 # ---- _pane_render_cmd -------------------------------------------------------
-
-def test_pane_render_cmd_external():
-    plotty._cfg["imgcat"] = "chafa -f sixels --size 60"
-    cmd = plotty._pane_render_cmd()
-    assert cmd.startswith("chafa -f sixels --size 60 ")
-    assert cmd.rstrip().endswith(plotty._last)
-
 
 def test_pane_render_cmd_builtin():
     plotty._cfg["imgcat"] = None
@@ -420,25 +554,17 @@ def test_invalid_dpi_is_ignored_with_warning(monkeypatch, capsys):
     assert "invalid dpi" in capsys.readouterr().err
 
 
-def test_enable_dpi_from_env(monkeypatch, fake_run):
+def test_enable_env_fallbacks_and_param_precedence(monkeypatch, fake_run):
+    # None-valued enable() args fall back to PLOTTY_* env vars; explicit args win
     monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
     monkeypatch.setenv("PLOTTY_DPI", "180")
-    plotty.enable(imgcat="builtin", viewer=False, verbose=0)
-    assert plotty._cfg["dpi"] == "180"
-
-
-def test_enable_dpi_param_overrides_env(monkeypatch, fake_run):
-    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
-    monkeypatch.setenv("PLOTTY_DPI", "180")
-    plotty.enable(imgcat="builtin", dpi=300, viewer=False, verbose=0)
-    assert plotty._cfg["dpi"] == 300
-
-
-def test_enable_size_from_env(monkeypatch, fake_run):
-    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
     monkeypatch.setenv("PLOTTY_SIZE", "42")
     plotty.enable(imgcat="builtin", viewer=False, verbose=0)
+    assert plotty._cfg["dpi"] == "180"
     assert str(plotty._cfg["size"]) == "42"
+    plotty.enable(imgcat="builtin", dpi=300, size=70, viewer=False, verbose=0)
+    assert plotty._cfg["dpi"] == 300
+    assert plotty._cfg["size"] == 70
 
 
 def test_resolve_inline_arg_and_env(monkeypatch):

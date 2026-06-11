@@ -101,7 +101,11 @@ that isn't your REPL). If the window only has your REPL pane, `enable()`
 automatically splits off a plot pane. Target a specific pane with
 `enable(target_pane=...)`.
 
-Public API: `enable()`, `disable()`, `redraw()`, `view()`, `__version__`.
+Public API: `enable()`, `disable()`, `redraw()`, `show(fig)`, `save(path)`,
+`status()`, `view()`, `__version__`. `status()` prints a diagnostic summary
+(mode, renderer, viewer state, tmux health); `save("out.png")` copies the last
+figure at full resolution; `disable(close_pane=True)` also closes the plot pane
+if plotty auto-created it.
 
 ### Demo
 
@@ -136,7 +140,10 @@ is identical to local.
 
 - **Viewer mode** (default in tmux) — a small viewer process lives in the target
   pane and redraws on new figures *and* on pane resize/zoom. Recommended; it's
-  the mode that survives resizing.
+  the mode that survives resizing. The plot pane also takes single keys:
+  **`p`/`k`** step back through recent figures, **`n`/`j`** step forward,
+  **`q`** quits the viewer. Re-running `enable(size=…, bg=…)` updates a running
+  viewer live; a new `target_pane` moves it.
 - **Inline mode** (default outside tmux, or `enable(inline=True)`) — the backend
   renders sixel itself, with no helper process, and writes it to the target
   pane's tty (in tmux) or to your stdout (no tmux). It does **not** auto-redraw
@@ -226,6 +233,8 @@ Both tmux layers must be ≥ 3.4 and built with sixel.
 | `size` | `PLOTTY_SIZE` | `60` | display width in terminal cells |
 | `dpi` | `PLOTTY_DPI` | matplotlib default | `savefig` DPI of the source image (raise it for sharper plots at large `size`) |
 | `imgcat` | `PLOTTY_IMGCAT` | auto | renderer command; `"builtin"` forces the built-in encoder |
+| `bg` | `PLOTTY_BG` | white | `#rrggbb` background composited under transparent figure regions (match your terminal for dark themes) |
+| `hist` | `PLOTTY_HIST` | `10` | recent figures kept for the viewer's history keys (`0` disables) |
 | `inline` | `PLOTTY_INLINE` | auto | `True`/`False` to force inline vs viewer-pane mode |
 | `clear` | `PLOTTY_CLEAR` | `True` | clear the pane before each draw |
 | `close` | `PLOTTY_CLOSE` | `True` | close figures after display |

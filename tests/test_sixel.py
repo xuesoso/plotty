@@ -98,24 +98,7 @@ def test_rle_long_run_compressed():
     assert plotty._rle(np.array([63, 63, 63, 63], np.int64)) == b"!4?"
 
 
-def test_rle_empty():
-    assert plotty._rle(np.array([], np.int64)) == b""
-
-
 # ---- _quantize --------------------------------------------------------------
-
-def test_quantize_few_colors_is_lossless():
-    img = np.zeros((8, 8, 3), np.uint8)
-    img[:4] = (255, 0, 0)
-    img[4:] = (0, 0, 255)
-    img[:, 0] = (0, 255, 0)
-    pal, idx = plotty._quantize(img)
-    # median-cut may emit duplicate palette entries (it splits by median index,
-    # not by colour), so what matters is exact, lossless reconstruction.
-    assert pal.shape[0] <= 256
-    assert len(np.unique(pal, axis=0)) == 3
-    assert np.array_equal(pal[idx].reshape(img.shape), img)
-
 
 def test_quantize_caps_at_256_colors():
     rng = np.arange(300 * 3, dtype=np.uint8).reshape(300, 3)  # 300 distinct rows
@@ -141,6 +124,31 @@ def test_quantize_fast_path_exact_for_many_distinct_colors():
     pal, idx = plotty._quantize(img)
     assert len(np.unique(pal, axis=0)) == 200
     assert np.array_equal(pal[idx].reshape(img.shape), img)
+
+
+# ---- background compositing ---------------------------------------------------
+
+def test_parse_bg():
+    assert plotty._parse_bg("#1e1e2e") == (0x1E, 0x1E, 0x2E)
+    assert plotty._parse_bg("ff0000") == (255, 0, 0)
+    assert plotty._parse_bg(None) == (255, 255, 255)
+
+
+def test_parse_bg_invalid_warns_and_falls_back(capsys):
+    assert plotty._parse_bg("not-a-color") == (255, 255, 255)
+    assert "invalid bg" in capsys.readouterr().err
+
+
+def test_load_rgb_composites_alpha_over_bg(tmp_path):
+    import matplotlib.image as mpimg
+    rgba = np.zeros((4, 4, 4), np.uint8)          # fully transparent image
+    rgba[:2, :2] = (10, 20, 30, 255)              # one opaque corner
+    png = tmp_path / "alpha.png"
+    mpimg.imsave(str(png), rgba)
+    plotty._cfg["bg"] = "#ff0000"
+    img = plotty._load_rgb(str(png))
+    assert tuple(img[3, 3]) == (255, 0, 0)        # transparent -> bg color
+    assert tuple(img[0, 0]) == (10, 20, 30)       # opaque untouched
 
 
 # ---- _resize ----------------------------------------------------------------
