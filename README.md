@@ -50,7 +50,7 @@ covers three setups:
 |---|---|
 | **Python** | ≥ 3.7 |
 | **tmux** | ≥ **3.4**, built with sixel support (`--enable-sixel`) |
-| **Terminal** | a sixel-capable terminal for display — e.g. WezTerm, foot, Konsole, `xterm -ti vt340` |
+| **Terminal** | a sixel-capable terminal — e.g. WezTerm, foot, Konsole, `xterm -ti vt340` — or **ghostty/kitty** (kitty graphics protocol, auto-detected) |
 | **Python deps** | `matplotlib` (and `numpy`, which ships with matplotlib) — **nothing else**: rendering uses plotty's built-in sixel encoder by default, no external tools |
 
 Check tmux:
@@ -86,8 +86,9 @@ uv pip install .
 
 ```python
 import plotty
-plotty.enable()                 # built-in sixel renderer, target the last tmux
-                                # pane, and spawn a tiny viewer there
+plotty.enable()                 # auto-detect the renderer (sixel or kitty
+                                # graphics), target the last tmux pane, and
+                                # spawn a tiny viewer there
 
 import matplotlib.pyplot as plt
 plt.plot([1, 4, 9, 16])
@@ -156,35 +157,63 @@ plotty.enable(inline=True)      # force inline even inside tmux
 
 plotty never injects bytes into the console you are typing in: outside tmux,
 viewer-pane mode falls back to inline, and auto-selected inline first queries
-the terminal for sixel support — if it has none (e.g. an IDE console), plotty
-warns and skips display instead of printing escape garbage. An explicit
-`enable(inline=True)` is trusted and always writes.
+the terminal for graphics support (sixel or kitty) — if it has neither (e.g.
+an IDE console), plotty warns and skips display instead of printing escape
+garbage. An explicit `enable(inline=True)` is trusted and always writes.
 
-## Sixel encoders
+## Renderers
 
-By default plotty renders with its **built-in, dependency-free sixel encoder**
-(pure stdlib + numpy) — **zero external tools**, identical behavior on every
-machine. It quantizes over the image's distinct colors — exact (lossless) when
-there are ≤256, fast count-weighted median-cut otherwise — and renders a
-typical plot in ~50 ms.
+By default plotty is **zero-dependency and protocol-aware**: it detects what
+your terminal supports and picks the right **built-in** encoder automatically —
 
-If you want **slightly faster rendering and better resampling/dithering** (most
-visible on photos/`imshow` and heavy downscaling), point plotty at an external
-sixel encoder:
+- **sixel-capable terminal** (WezTerm, foot, Konsole, xterm, …) → built-in
+  sixel encoder. It quantizes over the image's distinct colors — exact
+  (lossless) when there are ≤256, fast count-weighted median-cut otherwise —
+  and renders a typical plot in ~50 ms.
+- **no sixel** (ghostty, kitty) → built-in **kitty-graphics encoder** (see
+  below).
+
+Detection checks the terminal's identity first (ghostty/kitty always get the
+kitty-graphics encoder — they never render sixel, even when a tmux
+`terminal-features` override claims otherwise), then the terminal's own answers
+(a DA1/graphics query outside tmux; tmux's resolved client features inside), so
+`plotty.enable()` just works on both kinds of terminals. Override it any time:
 
 ```python
-plotty.enable(imgcat="chafa")       # or "img2sixel", "magick"
-plotty.enable(imgcat="auto")        # first external tool found on PATH
-# PLOTTY_IMGCAT=chafa works too; a full custom command string is also accepted
+plotty.enable(imgcat="builtin")     # force the built-in sixel encoder
+plotty.enable(imgcat="kitty")       # force the kitty-graphics encoder
+plotty.enable(imgcat="chafa")       # or "img2sixel", "magick": external sixel
+                                    # tools - slightly faster, better resampling
+# PLOTTY_IMGCAT=... works too; a full custom command string is also accepted
 ```
 
-- [`chafa`](https://github.com/hpjansson/chafa)
-- [`img2sixel`](https://github.com/saitoha/libsixel) (libsixel)
-- ImageMagick (`magick` / `convert`)
+External encoders ([`chafa`](https://github.com/hpjansson/chafa),
+[`img2sixel`](https://github.com/saitoha/libsixel), ImageMagick) are worth it
+for photos/`imshow` and heavy downscaling; if the requested tool isn't
+installed, plotty warns and falls back to the built-in encoder. The `bg`
+background option applies to the built-in encoders only.
 
-If the requested tool isn't installed, plotty warns and falls back to the
-built-in encoder. Note: the `bg` background option applies to the built-in
-encoder only.
+### ghostty / kitty terminals (no sixel)
+
+ghostty and kitty don't render sixel — for them plotty auto-selects its second
+built-in encoder, using the **kitty graphics protocol with Unicode
+placeholders**, the mechanism designed to make images robust *inside tmux*: the
+image data is sent once (passthrough-wrapped), while its placement is plain
+placeholder text that tmux tracks like any other text — so plots survive pane
+resize, zoom, and pane switches.
+
+One requirement inside tmux:
+
+```tmux
+# ~/.tmux.conf — let the image data through to the terminal (tmux >= 3.3)
+set -g allow-passthrough on
+```
+
+- Terminal must support kitty graphics **with Unicode placeholders** (kitty and
+  ghostty do; most other terminals don't).
+- Works in a local tmux and over SSH into a **single** remote tmux. **Nested
+  tmux is not supported** (passthrough doesn't survive two layers) — use a
+  sixel terminal for that setup.
 
 > plotty is **sixel-only** by design — sixel is the only path that survives tmux
 > and SSH. Non-sixel terminal-image protocols (kitty / iTerm) are not used. A
@@ -239,7 +268,7 @@ Both tmux layers must be ≥ 3.4 and built with sixel.
 | `target_pane` | `PLOTTY_PANE` | `-1` | tmux pane for the plot; negative indexes from the end (`-1` = last) |
 | `size` | `PLOTTY_SIZE` | `60` | display width in terminal cells |
 | `dpi` | `PLOTTY_DPI` | matplotlib default | `savefig` DPI of the source image (raise it for sharper plots at large `size`) |
-| `imgcat` | `PLOTTY_IMGCAT` | built-in encoder | `"chafa"`/`"img2sixel"`/`"magick"` for that tool, `"auto"` to detect one, or a custom command |
+| `imgcat` | `PLOTTY_IMGCAT` | auto-detect | picks built-in sixel or kitty-graphics by terminal; `"builtin"` forces sixel, `"kitty"` forces kitty graphics, `"chafa"`/`"img2sixel"`/`"magick"` use that tool, or a custom command |
 | `bg` | `PLOTTY_BG` | white | `#rrggbb` background composited under transparent figure regions (match your terminal for dark themes) |
 | `hist` | `PLOTTY_HIST` | `10` | recent figures kept for the viewer's history keys (`0` disables) |
 | `inline` | `PLOTTY_INLINE` | auto | `True`/`False` to force inline vs viewer-pane mode |
@@ -265,6 +294,9 @@ raise `dpi` so the source has enough pixels.
 - **"figures will not be displayed" warning:** your terminal didn't advertise
   sixel support when queried (common in IDE consoles) — use a sixel-capable
   terminal or tmux, or force output with `enable(inline=True)`.
+- **ghostty/kitty shows nothing with `imgcat="kitty"`:** run
+  `tmux set -g allow-passthrough on` (and add it to `~/.tmux.conf`), and make
+  sure you're not inside *nested* tmux — the kitty path supports one tmux layer.
 - **Image too large / small:** tune `size`. Blurry when enlarged? raise `dpi`.
 - **Plot doesn't refresh when you resize the pane:** use viewer mode (the default
   in tmux); inline mode doesn't auto-redraw on resize.

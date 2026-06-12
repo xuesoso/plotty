@@ -451,6 +451,17 @@ def test_enable_auto_inline_blocks_non_sixel_terminal(monkeypatch, fake_run, cap
     assert "does not appear to support sixel" in capsys.readouterr().err
 
 
+def test_enable_default_blocks_terminal_with_no_graphics(monkeypatch, fake_run):
+    # IDE console: neither sixel nor kitty -> detection falls back to sixel and
+    # the no-garbage gate still disables display
+    _pin_plain_terminal_env(monkeypatch)
+    monkeypatch.delenv("PLOTTY_IMGCAT", raising=False)
+    monkeypatch.setattr(plotty, "_probe_terminal", lambda: (False, False))
+    plotty.enable(viewer=False, verbose=0)
+    assert plotty._cfg["imgcat"] is None
+    assert plotty._cfg["can_display"] is False
+
+
 def test_enable_auto_inline_allows_sixel_terminal(monkeypatch, fake_run):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.setattr(plotty, "_stdout_supports_sixel", lambda: True)
@@ -491,15 +502,77 @@ def test_enable_default_is_builtin_even_with_tools_installed(monkeypatch, fake_r
     monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
     monkeypatch.delenv("PLOTTY_IMGCAT", raising=False)
     monkeypatch.setattr(plotty.shutil, "which", lambda c: f"/usr/bin/{c}")
+    fake_run.responses = {"display-message": "sixel,clipboard"}
     plotty.enable(viewer=False, verbose=0)        # no imgcat, chafa "installed"
-    assert plotty._cfg["imgcat"] is None          # built-in is the default
+    assert plotty._cfg["imgcat"] is None          # built-in sixel is the default
 
 
-def test_enable_imgcat_auto_detects_external(monkeypatch, fake_run):
+def test_detect_renderer_tmux_sixel_terminal(monkeypatch, fake_run):
     monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
-    monkeypatch.setattr(plotty.shutil, "which", lambda c: f"/usr/bin/{c}")
-    plotty.enable(imgcat="auto", viewer=False, verbose=0)
-    assert plotty._cfg["imgcat"] == plotty._CANDIDATES[0]   # first on PATH wins
+    fake_run.responses = {"display-message": "sixel,clipboard,title"}
+    assert plotty._detect_renderer() is None       # sixel terminal -> sixel
+
+
+def test_detect_renderer_tmux_no_sixel_picks_kitty(monkeypatch, fake_run):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    fake_run.responses = {"display-message": "clipboard,title"}
+    assert plotty._detect_renderer() == "kitty"
+
+
+def test_detect_renderer_tmux_ghostty_name_beats_sixel_features(monkeypatch, fake_run):
+    # a `terminal-features ',*:sixel'` override (standard nested-tmux setup)
+    # makes tmux claim sixel for EVERY client — but ghostty can't render it.
+    # The client's terminal name must win over the poisoned features signal.
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    fake_run.responses = {"client_termname": "xterm-ghostty\n",
+                          "display-message": "clipboard,sixel,title"}
+    assert plotty._detect_renderer() == "kitty"
+
+
+def test_detect_renderer_tmux_unknown_defaults_sixel(monkeypatch, fake_run):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")   # all queries return nothing
+    assert plotty._detect_renderer() is None
+
+
+def _pin_plain_terminal_env(monkeypatch):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("TERM_PROGRAM", raising=False)
+    monkeypatch.delenv("KITTY_WINDOW_ID", raising=False)
+
+
+def test_detect_renderer_outside_tmux(monkeypatch):
+    _pin_plain_terminal_env(monkeypatch)
+    monkeypatch.setattr(plotty, "_probe_terminal", lambda: (True, True))
+    assert plotty._detect_renderer() is None       # sixel wins when available
+    monkeypatch.setattr(plotty, "_probe_terminal", lambda: (False, True))
+    assert plotty._detect_renderer() == "kitty"    # kitty-only terminal
+    monkeypatch.setattr(plotty, "_probe_terminal", lambda: (None, None))
+    assert plotty._detect_renderer() is None       # unknown -> sixel default
+
+
+def test_detect_renderer_outside_tmux_env_fast_path(monkeypatch):
+    boom = lambda: (_ for _ in ()).throw(AssertionError("must not probe"))
+    _pin_plain_terminal_env(monkeypatch)
+    monkeypatch.setattr(plotty, "_probe_terminal", boom)
+    monkeypatch.setenv("TERM", "xterm-ghostty")
+    assert plotty._detect_renderer() == "kitty"
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    assert plotty._detect_renderer() == "kitty"
+    monkeypatch.delenv("TERM_PROGRAM", raising=False)
+    monkeypatch.setenv("KITTY_WINDOW_ID", "1")
+    assert plotty._detect_renderer() == "kitty"
+
+
+def test_enable_auto_detects_kitty_terminal(monkeypatch, fake_run, capsys):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.delenv("PLOTTY_IMGCAT", raising=False)
+    fake_run.responses = {"display-message": "clipboard,title",
+                          "allow-passthrough": "on", "-V": "tmux 3.5a"}
+    plotty.enable(imgcat="auto", viewer=False, verbose=1)
+    assert plotty._cfg["imgcat"] == "kitty"
+    assert "kitty-graphics encoder" in capsys.readouterr().err
 
 
 def test_enable_imgcat_shorthand_resolves_template(monkeypatch, fake_run):

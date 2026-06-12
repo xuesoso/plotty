@@ -56,6 +56,7 @@ def _isolate():
     """Snapshot/restore _cfg and clear stray cache files around each test."""
     snap = dict(plotty._cfg)
     plotty._warned.clear()
+    plotty._term_probe = None       # re-probe per test (it's monkeypatched anyway)
     for path in (plotty._pidfile, plotty._last, plotty._config):
         try:
             os.remove(path)
