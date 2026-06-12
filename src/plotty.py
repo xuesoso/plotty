@@ -11,12 +11,14 @@ bytes cross SSH, so it works the same locally and over a remote session.
     plotty.enable(target_pane=2)         # or pick a pane explicitly
     plotty.disable()                     # stop the viewer + auto-display
 
-Rendering uses the built-in, dependency-free sixel encoder by default (stdlib +
-numpy, which ships with matplotlib) — no external tools needed. Opt into an
-external sixel encoder with enable(imgcat="chafa") / "img2sixel" / "magick"
-(slightly faster, better resampling), imgcat="auto" to pick the first one on
-PATH, or pass a full custom command. A non-sixel command warns that it may not
-work over SSH.
+Rendering is zero-dependency and protocol-aware by default: plotty detects
+whether the terminal supports sixel and uses the built-in sixel encoder if so,
+else the built-in kitty-graphics encoder (Unicode placeholders — for ghostty/
+kitty; inside tmux it requires `tmux set -g allow-passthrough on`, single tmux
+layer only). Override with enable(imgcat=...): "builtin" forces sixel, "kitty"
+forces kitty graphics, "chafa"/"img2sixel"/"magick" use that external sixel
+tool (slightly faster, better resampling), or pass a full custom command. A
+non-sixel custom command warns that it may not work over SSH.
 
 Display modes: a viewer process running in a tmux pane (default in tmux), or
 "inline" mode which renders sixel itself (no viewer) and writes it to the target
@@ -87,10 +89,10 @@ __version__ = _find_version()
 
 _ENV = "PLOTTY"   # env var prefix (kept stable even if the file is renamed)
 
-# External sixel renderer candidates (opt-in: imgcat="auto" picks the first on
-# PATH; a bare tool name like imgcat="chafa" selects its template). Sixel is the
-# only SSH-robust path, so non-sixel protocols (kitty/iTerm) are intentionally
-# excluded. Placeholders are substituted at render time:
+# External sixel renderer candidates (opt-in: a bare tool name like
+# imgcat="chafa" selects its template). All sixel — the only non-sixel path is
+# the built-in kitty-graphics encoder (imgcat="kitty"). Placeholders are
+# substituted at render time:
 #   "{}"      -> the image path (else it's appended)
 #   "{size}"  -> display width in terminal cells  (_cfg["size"])
 #   "{width}" -> display width in pixels          (size cells * pane cell width)
@@ -178,14 +180,6 @@ def _is_sixel(cmd):
     return bool(cmd) and "sixel" in cmd.lower()
 
 
-def _auto_imgcat():
-    """Return the first renderer command available on PATH, else None."""
-    for cmd in _CANDIDATES:
-        if shutil.which(shlex.split(cmd)[0]):
-            return cmd
-    return None
-
-
 def _renderer_for(name):
     """The candidate template whose program is exactly `name`, or None."""
     for cmd in _CANDIDATES:
@@ -252,36 +246,53 @@ def _parse_da1(resp):
     return b"4" in m.group(1).split(b";")
 
 
-def _stdout_supports_sixel():
-    """Best-effort terminal sixel check via a DA1 query.
+_term_probe = None                               # cached (sixel, kitty) result
 
-    Returns False when stdout is not a terminal or the terminal's DA1 reply
-    lacks the sixel attribute (IDE consoles answer DA1 without it — dumping
-    raw sixel there just prints escape garbage). None means undeterminable.
+
+def _probe_terminal():
+    """Query the terminal once for graphics support: (sixel, kitty), each
+    True/False, or None when undeterminable. Cached for the process.
+
+    One round-trip: a kitty-graphics query (a=q; silently ignored by other
+    terminals) followed by DA1. Sixel = attribute 4 in the DA1 reply; kitty =
+    a graphics APC response arriving before it. False when stdout is not a
+    terminal (dumping escape bytes into a pipe/IDE console is never wanted).
     """
+    global _term_probe
+    if _term_probe is not None:
+        return _term_probe
+    sixel = kitty = None
     try:
         if not sys.stdout.isatty():
-            return False
-        if not sys.stdin.isatty():
-            return None                          # can't query without the tty
-        import termios
-        import tty as _tty
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        resp = b""
-        try:
-            _tty.setcbreak(fd)
-            sys.stdout.write("\x1b[c")           # DA1: "what are you?"
-            sys.stdout.flush()
-            while select.select([fd], [], [], 0.3)[0]:
-                resp += os.read(fd, 64)
-                if resp.rstrip().endswith(b"c"):
-                    break
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        return _parse_da1(resp)
+            sixel = kitty = False
+        elif sys.stdin.isatty():                 # can't query without the tty
+            import termios
+            import tty as _tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            resp = b""
+            try:
+                _tty.setcbreak(fd)
+                sys.stdout.write("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+                                 "\x1b[c")
+                sys.stdout.flush()
+                while select.select([fd], [], [], 0.3)[0]:
+                    resp += os.read(fd, 256)
+                    if resp.rstrip().endswith(b"c"):
+                        break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sixel = _parse_da1(resp)
+            kitty = (b"\x1b_G" in resp) if resp else None
     except Exception:
-        return None
+        pass
+    _term_probe = (sixel, kitty)
+    return _term_probe
+
+
+def _stdout_supports_sixel():
+    """Best-effort DA1 sixel check (see _probe_terminal); None = unknown."""
+    return _probe_terminal()[0]
 
 
 def _target_px_width(fd):
@@ -451,9 +462,132 @@ def _sixel_bytes(palette, indices, h, w):
     return bytes(out)
 
 
+# ---- kitty graphics encoder (Unicode placeholders; for ghostty/kitty) -------
+#
+# Opt-in via enable(imgcat="kitty"). Transmits the PNG with the kitty graphics
+# protocol as a *virtual* placement (U=1) and then draws it as plain Unicode
+# placeholder text (U+10EEEE cells with row/column diacritics, image id in the
+# foreground color). Because the placeholders are ordinary text, tmux tracks
+# them in its grid and redraws them itself — the image survives pane resize,
+# zoom and pane switches. This is the one robust non-sixel path inside tmux;
+# ghostty (which refuses sixel) and kitty are the terminals that support it.
+# Inside tmux the transmission APCs must be passthrough-wrapped, which requires
+# `set -g allow-passthrough on` (tmux >= 3.3); the placeholder text is not
+# wrapped. Nested tmux is not supported (passthrough does not survive two
+# layers). q=2 keeps the terminal quiet: replies cannot route back through tmux.
+
+_PLACEHOLDER = "\U0010EEEE"
+_DIACRITICS = (                                  # kitty's rowcolumn-diacritics
+    0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346,
+    0x034A, 0x034B, 0x034C, 0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363,
+    0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369, 0x036A, 0x036B, 0x036C,
+    0x036D, 0x036E, 0x036F, 0x0483, 0x0484, 0x0485, 0x0486, 0x0487, 0x0592,
+    0x0593, 0x0594, 0x0595, 0x0597, 0x0598, 0x0599, 0x059C, 0x059D, 0x059E,
+    0x059F, 0x05A0, 0x05A1, 0x05A8, 0x05A9, 0x05AB, 0x05AC, 0x05AF, 0x05C4,
+    0x0610, 0x0611, 0x0612, 0x0613, 0x0614, 0x0615, 0x0616, 0x0617, 0x0657,
+    0x0658, 0x0659, 0x065A, 0x065B, 0x065D, 0x065E, 0x06D6, 0x06D7, 0x06D8,
+    0x06D9, 0x06DA, 0x06DB, 0x06DC, 0x06DF, 0x06E0, 0x06E1, 0x06E2, 0x06E4,
+    0x06E7, 0x06E8, 0x06EB, 0x06EC, 0x0730, 0x0732, 0x0733, 0x0735, 0x0736,
+    0x073A, 0x073D, 0x073F, 0x0740, 0x0741, 0x0743, 0x0745, 0x0747, 0x0749,
+    0x074A, 0x07EB, 0x07EC, 0x07ED, 0x07EE, 0x07EF, 0x07F0, 0x07F1, 0x07F3,
+    0x0816, 0x0817, 0x0818, 0x0819, 0x081B, 0x081C, 0x081D, 0x081E, 0x081F,
+    0x0820, 0x0821, 0x0822, 0x0823, 0x0825, 0x0826, 0x0827, 0x0829, 0x082A,
+    0x082B, 0x082C, 0x082D, 0x0951, 0x0953, 0x0954, 0x0F82, 0x0F83, 0x0F86,
+    0x0F87, 0x135D, 0x135E, 0x135F, 0x17DD, 0x193A, 0x1A17, 0x1A75, 0x1A76,
+    0x1A77, 0x1A78, 0x1A79, 0x1A7A, 0x1A7B, 0x1A7C, 0x1B6B, 0x1B6D, 0x1B6E,
+    0x1B6F, 0x1B70, 0x1B71, 0x1B72, 0x1B73, 0x1CD0, 0x1CD1, 0x1CD2, 0x1CDA,
+    0x1CDB, 0x1CE0, 0x1DC0, 0x1DC1, 0x1DC3, 0x1DC4, 0x1DC5, 0x1DC6, 0x1DC7,
+    0x1DC8, 0x1DC9, 0x1DCB, 0x1DCC, 0x1DD1, 0x1DD2, 0x1DD3, 0x1DD4, 0x1DD5,
+    0x1DD6, 0x1DD7, 0x1DD8, 0x1DD9, 0x1DDA, 0x1DDB, 0x1DDC, 0x1DDD, 0x1DDE,
+    0x1DDF, 0x1DE0, 0x1DE1, 0x1DE2, 0x1DE3, 0x1DE4, 0x1DE5, 0x1DE6, 0x1DFE,
+    0x20D0, 0x20D1, 0x20D4, 0x20D5, 0x20D6, 0x20D7, 0x20DB, 0x20DC, 0x20E1,
+    0x20E7, 0x20E9, 0x20F0, 0x2CEF, 0x2CF0, 0x2CF1, 0x2DE0, 0x2DE1, 0x2DE2,
+    0x2DE3, 0x2DE4, 0x2DE5, 0x2DE6, 0x2DE7, 0x2DE8, 0x2DE9, 0x2DEA, 0x2DEB,
+    0x2DEC, 0x2DED, 0x2DEE, 0x2DEF, 0x2DF0, 0x2DF1, 0x2DF2, 0x2DF3, 0x2DF4,
+    0x2DF5, 0x2DF6, 0x2DF7, 0x2DF8, 0x2DF9, 0x2DFA, 0x2DFB, 0x2DFC, 0x2DFD,
+    0x2DFE, 0x2DFF, 0xA66F, 0xA67C, 0xA67D, 0xA6F0, 0xA6F1, 0xA8E0, 0xA8E1,
+    0xA8E2, 0xA8E3, 0xA8E4, 0xA8E5, 0xA8E6, 0xA8E7, 0xA8E8, 0xA8E9, 0xA8EA,
+    0xA8EB, 0xA8EC, 0xA8ED, 0xA8EE, 0xA8EF, 0xA8F0, 0xA8F1, 0xAAB0, 0xAAB2,
+    0xAAB3, 0xAAB7, 0xAAB8, 0xAABE, 0xAABF, 0xAAC1, 0xFE20, 0xFE21, 0xFE22,
+    0xFE23, 0xFE24, 0xFE25, 0xFE26, 0x10A0F, 0x10A38, 0x1D185, 0x1D186,
+    0x1D187, 0x1D188, 0x1D189, 0x1D1AA, 0x1D1AB, 0x1D1AC, 0x1D1AD, 0x1D242,
+    0x1D243, 0x1D244,
+)
+
+
+def _kitty_id():
+    """Image id (1-255, fits the 8-bit SGR fg encoding), stable per process."""
+    return (os.getpid() % 255) + 1
+
+
+def _wrap_tmux(seq):
+    """Wrap an escape sequence in tmux's passthrough envelope (ESCs doubled)."""
+    return b"\x1bPtmux;" + seq.replace(b"\x1b", b"\x1b\x1b") + b"\x1b\\"
+
+
+def _png_size(data):
+    """(width, height) from a PNG IHDR header, or None."""
+    import struct
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", data[16:24])
+
+
+def _kitty_bytes(png, cols, rows, wrap):
+    """Kitty-graphics stream: delete the old image, transmit `png` as a virtual
+    placement of cols x rows cells, then print the Unicode placeholder grid."""
+    import base64
+    iid = _kitty_id()
+    apcs = [b"\x1b_Ga=d,d=I,i=%d,q=2\x1b\\" % iid]      # free the previous image
+    payload = base64.standard_b64encode(png)
+    chunks = [payload[i:i + 4096] for i in range(0, len(payload), 4096)] or [b""]
+    head = b"a=T,U=1,q=2,f=100,t=d,i=%d,c=%d,r=%d" % (iid, cols, rows)
+    for n, chunk in enumerate(chunks):
+        more = 1 if n < len(chunks) - 1 else 0
+        keys = (head + b",m=%d" % more) if n == 0 else b"m=%d" % more
+        apcs.append(b"\x1b_G" + keys + b";" + chunk + b"\x1b\\")
+    out = bytearray()
+    for apc in apcs:
+        out += _wrap_tmux(apc) if wrap else apc
+    out += b"\x1b[38;5;%dm" % iid                       # id rides the fg color
+    for row in range(rows):
+        line = "".join(_PLACEHOLDER + chr(_DIACRITICS[row]) + chr(_DIACRITICS[col])
+                       for col in range(cols))
+        out += line.encode("utf-8")
+        if row < rows - 1:
+            out += b"\r\n"
+    out += b"\x1b[39m\r\n"
+    return bytes(out)
+
+
+def _render_kitty(path, fd):
+    """Render `path` via kitty graphics + Unicode placeholders (imgcat="kitty")."""
+    with open(path, "rb") as f:
+        png = f.read()
+    if _cfg.get("bg"):                                  # honor bg compositing
+        import io
+        buf = io.BytesIO()
+        mpimg.imsave(buf, _load_rgb(path), format="png")
+        png = buf.getvalue()
+    iw, ih = _png_size(png) or (4, 3)
+    cols, rows, xpix, ypix = _winsize(fd)
+    cell_w = (xpix / cols) if (xpix and cols) else 10.0
+    cell_h = (ypix / rows) if (ypix and rows) else 20.0
+    limit = len(_DIACRITICS)
+    c = max(1, min(int(_cfg["size"]), cols or limit, limit))
+    r = max(1, round(c * cell_w * ih / (iw * cell_h)))
+    max_r = min(max((rows or 24) - 1, 1), limit)
+    if r > max_r:                                       # too tall: keep aspect
+        c = max(1, round(c * max_r / r))
+        r = max_r
+    return _kitty_bytes(png, c, r, wrap=os.environ.get("TMUX") is not None)
+
+
 def _render_bytes(path, fd):
     """Return the terminal byte stream to display `path` (external cmd or built-in)."""
     cmd = _cfg["imgcat"]
+    if cmd == "kitty":
+        return _render_kitty(path, fd)
     if cmd:
         full = _fmt(_resolve_cmd(cmd, fd), path)
         return subprocess.run(["sh", "-c", full], capture_output=True).stdout
@@ -584,7 +718,7 @@ def _signal_viewer():
 def _pane_render_cmd():
     """Shell command that renders last.png in the plot pane (external or built-in)."""
     cmd = _cfg["imgcat"]
-    if cmd:
+    if cmd and cmd != "kitty":
         fd, opened = -1, None
         if "{width}" in cmd:                     # needs the pane's pixel width
             tty = _pane_tty(_cfg["pane"])
@@ -598,8 +732,9 @@ def _pane_render_cmd():
         if opened is not None:
             os.close(opened)
         return _fmt(resolved, _last)
+    imgval = "kitty" if cmd == "kitty" else "''"  # empty == built-in sixel
     env = (
-        f"{_ENV}_IMGCAT='' "                      # force built-in in the subprocess
+        f"{_ENV}_IMGCAT={imgval} "
         f"{_ENV}_CACHE={shlex.quote(_cache)} "
         f"{_ENV}_SIZE={shlex.quote(str(_cfg['size']))}"
     )
@@ -953,6 +1088,16 @@ def _tmux_version():
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def _tmux_passthrough():
+    """Value of tmux's allow-passthrough option ('on'/'all'/'off'), or None."""
+    try:
+        out = subprocess.run([_cfg["tmux"], "show", "-gv", "allow-passthrough"],
+                             capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return None
+    return out.strip() or None
+
+
 def _tmux_features():
     """The terminal features tmux has resolved for the current client, if any."""
     for fmt in ("#{client_termfeatures}", "#{terminal-features}"):
@@ -974,9 +1119,21 @@ def _health_check(verbose):
     intmux = os.environ.get("TMUX") is not None
     if _cfg["inline"]:
         where = "the target tmux pane" if intmux else "this terminal"
-        print(f"[{name}] inline mode: piping sixel to {where} "
-              f"(requires a sixel-capable terminal)", file=sys.stderr)
-    if intmux:                                   # both modes lean on tmux's sixel
+        proto = "kitty graphics" if _cfg.get("imgcat") == "kitty" else "sixel"
+        print(f"[{name}] inline mode: piping {proto} to {where}", file=sys.stderr)
+    if intmux and _cfg.get("imgcat") == "kitty":  # kitty protocol needs passthrough
+        ver = _tmux_version()
+        if ver is not None and ver < (3, 3):
+            print(f"[{name}] tmux {ver[0]}.{ver[1]} is older than 3.3 and has no "
+                  f"allow-passthrough; kitty graphics will not display",
+                  file=sys.stderr)
+        ap = _tmux_passthrough()
+        if ap is not None and ap not in ("on", "all"):
+            print(f"[{name}] kitty graphics need tmux passthrough; run: tmux set "
+                  f"-g allow-passthrough on (and add it to ~/.tmux.conf). Also "
+                  f"requires a kitty-protocol terminal (kitty, ghostty); nested "
+                  f"tmux is not supported", file=sys.stderr)
+    elif intmux:                                 # sixel modes lean on tmux's sixel
         ver = _tmux_version()
         if ver is not None and ver < (3, 4):
             print(f"[{name}] tmux {ver[0]}.{ver[1]} is older than 3.4 and may not "
@@ -1003,27 +1160,68 @@ def _resolve_inline(inline):
     return os.environ.get("TMUX") is None
 
 
-def _resolve_imgcat(imgcat, verbose):
-    """Resolve the renderer command, where None means the built-in encoder.
+def _client_termname():
+    """TERM of the attached tmux client (e.g. 'xterm-ghostty'), best effort."""
+    try:
+        out = subprocess.run([_cfg["tmux"], "display-message", "-p",
+                              "#{client_termname}"],
+                             capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return ""
+    return out.strip()
 
-    The default (imgcat=None, no PLOTTY_IMGCAT) is the built-in, dependency-free
-    encoder. "chafa"/"img2sixel"/"magick"/"convert" select that external tool
-    (warning + built-in fallback if it isn't installed), "auto" picks the first
-    external tool found on PATH, "" / "builtin" / False force the built-in, and
-    any other string is used as a custom command.
+
+def _detect_renderer():
+    """Pick the built-in encoder for this terminal: sixel when the terminal
+    advertises it, else the kitty-graphics encoder; sixel when undeterminable.
+
+    The terminal's *identity* is checked before its advertised features:
+    ghostty/kitty never render sixel, while a `terminal-features ',*:sixel'`
+    override (the standard nested-tmux setup) makes tmux claim sixel for every
+    client — so for those terminals the name is the truthful signal. In tmux
+    the *outer* terminal's capabilities are what matter (tmux's own DA1 reply
+    advertises whatever tmux was built with); outside tmux, query directly.
+    """
+    if os.environ.get("TMUX") is not None:
+        term = _client_termname()
+        if "ghostty" in term or "kitty" in term:
+            return "kitty"                       # these never render sixel
+        feats = _tmux_features()
+        if feats and "sixel" not in feats:
+            return "kitty"
+        return None                              # sixel (or unknown -> sixel)
+    ident = os.environ.get("TERM", "") + " " + os.environ.get("TERM_PROGRAM", "")
+    if "ghostty" in ident or "kitty" in ident or os.environ.get("KITTY_WINDOW_ID"):
+        return "kitty"
+    sixel, kitty = _probe_terminal()
+    if not sixel and kitty:
+        return "kitty"
+    return None                                  # sixel (or unknown -> sixel)
+
+
+def _resolve_imgcat(imgcat, verbose):
+    """Resolve the renderer command, where None means the built-in sixel encoder.
+
+    The default (imgcat=None or "auto", no PLOTTY_IMGCAT) auto-detects the
+    terminal's protocol: sixel-capable -> built-in sixel encoder, otherwise the
+    built-in kitty-graphics encoder (ghostty/kitty). Explicit overrides:
+    "builtin"/""/False -> built-in sixel; "kitty" -> kitty-graphics encoder;
+    "chafa"/"img2sixel"/"magick"/"convert" -> that external tool (warning +
+    built-in fallback if it isn't installed); any other string -> custom command.
     """
     if imgcat is None:
         imgcat = _env("IMGCAT", None)
-    if imgcat in (None, "", "builtin", False):
-        return None                              # built-in encoder (the default)
-    if imgcat == "auto":
-        imgcat = _auto_imgcat()
-        if imgcat is None:
-            if verbose:
-                print(f"[{__name__}] no external renderer on PATH; using the "
-                      f"built-in sixel encoder", file=sys.stderr)
-            return None
-    elif _renderer_for(imgcat):                  # bare tool name, e.g. "chafa"
+    if imgcat in (None, "auto"):                 # default: protocol detection
+        imgcat = _detect_renderer()
+        if imgcat == "kitty" and verbose:
+            print(f"[{__name__}] terminal does not advertise sixel: using the "
+                  f"built-in kitty-graphics encoder", file=sys.stderr)
+        return imgcat
+    if imgcat in ("", "builtin", False):
+        return None                              # built-in sixel encoder
+    if imgcat == "kitty":
+        return "kitty"                           # built-in kitty-graphics encoder
+    if _renderer_for(imgcat):                    # bare tool name, e.g. "chafa"
         if shutil.which(imgcat):
             imgcat = _renderer_for(imgcat)
         else:
@@ -1048,11 +1246,15 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     terminal's stdout when not. inline=True forces inline even inside tmux;
     inline=False forces viewer-pane mode. `PLOTTY_INLINE=1/0` sets the default.
 
-    imgcat=None (default) uses the built-in, dependency-free sixel encoder.
-    Pass imgcat="chafa" / "img2sixel" / "magick" to use that external tool
-    (slightly faster, better resampling; falls back to built-in with a warning
-    if it isn't installed), imgcat="auto" to pick the first external tool on
-    PATH, or a full command string to use it verbatim. `PLOTTY_IMGCAT` sets the
+    imgcat=None (default, same as "auto") detects the terminal's protocol:
+    sixel-capable terminals get the built-in sixel encoder, others (ghostty,
+    kitty) get the built-in kitty-graphics encoder (Unicode placeholders —
+    robust inside a single tmux; needs `tmux set -g allow-passthrough on`; not
+    nested tmux). Overrides: imgcat="builtin" forces the sixel encoder,
+    imgcat="kitty" forces the kitty encoder, imgcat="chafa" / "img2sixel" /
+    "magick" uses that external sixel tool (slightly faster, better resampling;
+    falls back to built-in with a warning if it isn't installed), and any other
+    string is used verbatim as a custom command. `PLOTTY_IMGCAT` sets the
     default. This applies to both viewer and inline modes.
 
     size (display width in cells, default 60) and dpi (matplotlib savefig DPI;
@@ -1098,7 +1300,9 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
         if intmux:
             # pipe sixel to a separate pane's tty (never the REPL's own pane)
             _cfg["pane"] = _ensure_separate_pane(target_pane, verbose)
-        elif inline is not True:                 # auto-selected: verify the terminal
+        elif inline is not True and _cfg["imgcat"] != "kitty":
+            # auto-selected inline: verify the terminal renders sixel (the kitty
+            # encoder is an explicit opt-in and doesn't need the sixel attribute)
             if _stdout_supports_sixel() is False:
                 _cfg["can_display"] = False
                 if verbose:
@@ -1165,10 +1369,13 @@ def status():
             + f" ({st.st_size} bytes)"
     except OSError:
         last = "never"
+    renderer = _cfg["imgcat"] or "built-in sixel encoder"
+    if renderer == "kitty":
+        renderer = "built-in kitty graphics (unicode placeholders)"
     lines = [
         f"plotty {__version__}",
         f"  mode:      {mode}",
-        f"  renderer:  {_cfg['imgcat'] or 'built-in sixel encoder'}",
+        f"  renderer:  {renderer}",
         f"  size:      {_cfg['size']} cells   dpi: {_cfg['dpi'] or 'default'}   "
         f"bg: {_cfg.get('bg') or 'white'}",
         f"  viewer:    {viewer}",

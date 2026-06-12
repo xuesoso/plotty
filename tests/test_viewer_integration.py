@@ -100,6 +100,44 @@ def test_viewer_exits_cleanly_when_pane_dies(tmp_path):
     assert not pidfile.exists(), "viewer did not clean up its pidfile on exit"
 
 
+def test_viewer_kitty_renderer(tmp_path):
+    """A viewer spawned with PLOTTY_IMGCAT=kitty emits Unicode-placeholder
+    frames (kitty graphics) instead of sixel, and still exits cleanly."""
+    import matplotlib.image as mpimg
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    arr = np.zeros((30, 40, 3), np.uint8)
+    arr[:, :20] = (200, 30, 30)
+    mpimg.imsave(str(cache / "last.png"), arr)
+
+    env = dict(os.environ)
+    env.update(PLOTTY_CACHE=str(cache), PLOTTY_IMGCAT="kitty",
+               PLOTTY_CLEAR="0", PLOTTY_SIZE="20")
+    proc = subprocess.Popen([sys.executable, plotty.__file__, "--view"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, env=env)
+    pidfile = cache / "viewer.pid"
+    try:
+        deadline = time.time() + 15
+        while not pidfile.exists() and time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail("viewer exited before writing pidfile")
+            time.sleep(0.05)
+        time.sleep(0.3)
+        os.kill(proc.pid, signal.SIGTERM)
+        out, _ = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 0
+    assert b"\xf4\x8e\xbb\xae" in out          # U+10EEEE placeholder (UTF-8)
+    assert b"_G" in out                        # kitty graphics APC present
+    assert b"\x1bPq" not in out                # and no sixel
+
+
 def test_viewer_history_keys_via_pty(tmp_path):
     """With a real pty as stdin, 'p' steps back through history (extra frame +
     status note) and 'q' quits cleanly."""
