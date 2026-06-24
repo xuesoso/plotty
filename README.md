@@ -95,21 +95,24 @@ plt.plot([1, 4, 9, 16])
 # IPython: the figure appears automatically after each cell.
 # Plain REPL: call plt.show().
 
-plotty.disable()                # stop the viewer and restore matplotlib
+plotty.disable()                # stop the viewer, restore matplotlib, and close
+                                # plotty's auto-created plot pane
 ```
 
 Inside tmux, plotty draws into a dedicated plot pane in the current window. The
-first `enable()` splits one off next to your REPL and reuses it on later calls;
-if you close that pane, the next `enable()` makes a new one. So plotty never
-hijacks a pane you opened yourself (an editor, logs, …). Target a specific pane
-instead with `enable(target_pane=...)` — an int indexes the window's panes
+first `enable()` splits one off your REPL — along its longer side, so a wide pane
+gets the plot beside it and a tall pane gets it below — and reuses that pane on
+later calls; if you close it, the next `enable()` makes a new one. So plotty
+never hijacks a pane you opened yourself (an editor, logs, …). Target a specific
+pane instead with `enable(target_pane=...)` — an int indexes the window's panes
 (`-1` = last), or pass a name like `sess:win.pane`.
 
 Public API: `enable()`, `disable()`, `redraw()`, `show(fig)`, `save(path)`,
 `status()`, `view()`, `__version__`. `status()` prints a diagnostic summary
 (mode, renderer, viewer state, tmux health); `save("out.png")` copies the last
-figure at full resolution; `disable(close_pane=True)` also closes the plot pane
-if plotty auto-created it.
+figure at full resolution; `disable()` closes plotty's auto-created plot pane by
+default (a pane you passed via `target_pane` is left open) — pass
+`disable(close_pane=False)` to keep the auto-created pane and its last figure.
 
 ### Demo
 
@@ -139,6 +142,10 @@ Two cooperating pieces share state via the filesystem + OS signals:
 
 Because only sixel bytes cross SSH and everything else is host-local, remote use
 is identical to local.
+
+Inside tmux this state is keyed per window (`~/.cache/plotty/win-<id>/`), so a
+REPL in one window and a REPL in another each get their own plot pane and viewer
+instead of fighting over a shared one.
 
 ## Display modes
 
@@ -282,7 +289,7 @@ Both tmux layers must be ≥ 3.4 and built with sixel.
 | `tmux` | `PLOTTY_TMUX` | `tmux` | tmux binary to use |
 | `viewer` | — | `True` | spawn the viewer process (tmux mode) |
 | `verbose` | — | `1` | print startup health-check warnings |
-| — | `PLOTTY_CACHE` | `~/.cache/plotty` | state directory (`last.png`, pidfile) |
+| — | `PLOTTY_CACHE` | `~/.cache/plotty` | base state directory; inside tmux each window gets its own `win-<id>/` subdir (`last.png`, pidfile) so concurrent REPLs don't collide |
 
 `size` and `dpi` are independent: `size` is how wide the image is *displayed*,
 `dpi` is how many pixels the *source* has. For a crisp image at a large `size`,

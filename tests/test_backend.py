@@ -8,6 +8,54 @@ import pathlib
 import plotty
 
 
+# ---- per-tmux-window cache keying -------------------------------------------
+
+def test_window_cache_keys_by_window(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"display-message": "@7\n"}    # window_id (@-prefixed)
+    assert plotty._window_cache("/base") == "/base/win-7"
+
+
+def test_window_cache_base_when_not_tmux(monkeypatch, fake_run):
+    monkeypatch.delenv("TMUX", raising=False)
+    assert plotty._window_cache("/base") == "/base"
+    assert fake_run.calls == []                         # no tmux query off-tmux
+
+
+def test_window_cache_scoped_to_own_window(fake_run, monkeypatch):
+    # must resolve OUR window via $TMUX_PANE, not the client's focused window,
+    # else a backgrounded REPL keys onto the wrong window's cache
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%3")
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"display-message": "@2\n"}
+    assert plotty._window_cache("/base") == "/base/win-2"
+    call = next(c for c in fake_run.calls if "display-message" in c)
+    assert "-t" in call and "%3" in call
+
+
+def test_window_cache_base_when_no_window_id(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {}                             # display-message -> ""
+    assert plotty._window_cache("/base") == "/base"
+
+
+def test_set_cache_repoints_path_globals(tmp_path):
+    saved = (plotty._cache, plotty._last, plotty._pidfile,
+             plotty._config, plotty._histdir)
+    try:
+        plotty._set_cache(str(tmp_path / "win-9"))
+        assert plotty._cache == str(tmp_path / "win-9")
+        assert plotty._pidfile == str(tmp_path / "win-9" / "viewer.pid")
+        assert plotty._last == str(tmp_path / "win-9" / "last.png")
+        assert os.path.isdir(plotty._cache)            # created it
+    finally:
+        (plotty._cache, plotty._last, plotty._pidfile,
+         plotty._config, plotty._histdir) = saved
+
+
 # ---- live settings (config.json) ---------------------------------------------
 
 def test_write_config_load_settings_roundtrip(monkeypatch):
@@ -126,6 +174,21 @@ def test_disable_leaves_user_panes_alone(fake_run):
     plotty._cfg.update(made_pane=None, tmux="tmux")
     plotty.disable(close_pane=True, verbose=0)
     assert not any("kill-pane" in " ".join(c) for c in fake_run.calls)
+
+
+def test_disable_closes_auto_created_pane_by_default(fake_run):
+    plotty._cfg.update(made_pane="%7", tmux="tmux")
+    plotty.disable(verbose=0)                       # no close_pane arg -> defaults True
+    assert any(c[:3] == ["tmux", "kill-pane", "-t"] and c[3] == "%7"
+               for c in fake_run.calls)
+    assert plotty._cfg["made_pane"] is None
+
+
+def test_disable_close_pane_false_keeps_pane(fake_run):
+    plotty._cfg.update(made_pane="%7", tmux="tmux")
+    plotty.disable(close_pane=False, verbose=0)     # opt out: keep the pane
+    assert not any("kill-pane" in " ".join(c) for c in fake_run.calls)
+    assert plotty._cfg["made_pane"] == "%7"
 
 
 def test_show_explicit_figure(monkeypatch):
@@ -267,6 +330,24 @@ def test_resolve_pane_skips_repl_own_pane(fake_run, monkeypatch):
     assert plotty._resolve_pane(-1) == "%11"   # never draw into the REPL itself
 
 
+def test_split_direction_wide_pane_beside(fake_run):
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"display-message": "80 24\n"}   # wide
+    assert plotty._split_direction("%5") == "-h"
+
+
+def test_split_direction_tall_pane_below(fake_run):
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"display-message": "40 60\n"}   # tall (60*2 > 40)
+    assert plotty._split_direction("%5") == "-v"
+
+
+def test_split_direction_defaults_h_when_unknown(fake_run):
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {}                                # no size reported
+    assert plotty._split_direction("%5") == "-h"
+
+
 def test_ensure_separate_pane_splits_when_only_own_pane(fake_run, monkeypatch, capsys):
     monkeypatch.setenv("TMUX_PANE", "%5")
     fake_run.responses = {"list-panes": "%5\n", "split-window": "%7\n"}
@@ -295,6 +376,15 @@ def test_find_dedicated_pane_returns_tagged(fake_run):
     plotty._cfg.update(tmux="tmux")
     fake_run.responses = {"list-panes": "%10 \n%11 1\n%12 \n"}   # %11 is tagged
     assert plotty._find_dedicated_pane() == "%11"
+
+
+def test_find_dedicated_pane_scoped_to_own_window(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "%3")
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"list-panes": "%3 \n%4 1\n"}
+    assert plotty._find_dedicated_pane() == "%4"
+    call = next(c for c in fake_run.calls if "list-panes" in c)
+    assert "-t" in call and "%3" in call           # scoped to the REPL's window
 
 
 def test_find_dedicated_pane_none_when_untagged(fake_run):
