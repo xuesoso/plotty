@@ -289,6 +289,134 @@ def test_ensure_separate_pane_failure_disables_display(fake_run, monkeypatch, ca
     assert "cannot display figures" in capsys.readouterr().err
 
 
+# ---- dedicated plot pane (target_pane="auto") -------------------------------
+
+def test_find_dedicated_pane_returns_tagged(fake_run):
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"list-panes": "%10 \n%11 1\n%12 \n"}   # %11 is tagged
+    assert plotty._find_dedicated_pane() == "%11"
+
+
+def test_find_dedicated_pane_none_when_untagged(fake_run):
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"list-panes": "%10 \n%11 \n"}          # nothing tagged
+    assert plotty._find_dedicated_pane() is None
+
+
+def test_ensure_dedicated_pane_reuses_existing(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    fake_run.responses = {"list-panes": "%5 \n%9 1\n"}           # %9 already plotty's
+    plotty._cfg.update(tmux="tmux", made_pane=None)
+    assert plotty._ensure_dedicated_pane(verbose=0) == "%9"
+    assert plotty._cfg["made_pane"] == "%9"      # owned: disable(close_pane=True) closes it
+    assert not any("split-window" in " ".join(c) for c in fake_run.calls)
+
+
+def test_ensure_dedicated_pane_splits_and_tags_when_missing(fake_run, monkeypatch, capsys):
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    fake_run.responses = {"list-panes": "%5 \n", "split-window": "%7\n"}
+    plotty._cfg.update(tmux="tmux", made_pane=None)
+    pane = plotty._ensure_dedicated_pane(verbose=1)
+    assert pane == "%7"
+    assert plotty._cfg["made_pane"] == "%7"
+    assert plotty._cfg["can_display"] is True
+    split = next(c for c in fake_run.calls if "split-window" in c)
+    assert "-d" in split                         # don't steal focus from the REPL
+    tag = next(c for c in fake_run.calls if "set" in c and plotty._DEDICATED_OPT in c)
+    assert tag[-2:] == [plotty._DEDICATED_OPT, "1"] and "%7" in tag
+    assert "created dedicated plot pane" in capsys.readouterr().err
+
+
+def test_ensure_dedicated_pane_failure_disables_display(fake_run, monkeypatch, capsys):
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    fake_run.responses = {"list-panes": "%5 \n"}   # split-window returns nothing
+    plotty._cfg.update(tmux="tmux", can_display=True)
+    plotty._ensure_dedicated_pane(verbose=1)
+    assert plotty._cfg["can_display"] is False
+    assert "cannot display figures" in capsys.readouterr().err
+
+
+def test_resolve_display_pane_auto_uses_dedicated(fake_run, monkeypatch):
+    monkeypatch.delenv("PLOTTY_PANE", raising=False)
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    fake_run.responses = {"list-panes": "%5 \n%9 1\n"}
+    assert plotty._resolve_display_pane("auto", verbose=0) == "%9"
+
+
+def test_resolve_display_pane_explicit_overrides_auto(fake_run):
+    # an explicit int takes the classic path (positive index = passthrough),
+    # never the dedicated-pane logic
+    assert plotty._resolve_display_pane(2, verbose=0) == "2"
+    assert not any("split-window" in " ".join(c) for c in fake_run.calls)
+
+
+def test_resolve_display_pane_env_overrides_auto(fake_run, monkeypatch):
+    monkeypatch.setenv("PLOTTY_PANE", "3")         # PLOTTY_PANE overrides "auto"
+    assert plotty._resolve_display_pane("auto", verbose=0) == "3"
+
+
+# ---- recreate the dedicated pane when the user kills it ----------------------
+
+def test_pane_alive_true_false(fake_run):
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"display-message": "%9\n"}
+    assert plotty._pane_alive("%9") is True
+    fake_run.responses = {}                         # default "" -> pane is gone
+    assert plotty._pane_alive("%9") is False
+
+
+def test_refresh_recreates_killed_dedicated_pane(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%5")
+    # display-message (the alive-probe) returns nothing -> the old pane is dead;
+    # list-panes has nothing tagged -> split a fresh one (%7)
+    fake_run.responses = {"split-window": "%7\n", "list-panes": "%5 \n"}
+    plotty._cfg.update(tmux="tmux", auto_pane=True, inline=False, pane="%9",
+                       can_display=True, made_pane=None, verbose=0)
+    assert plotty._refresh_display_pane() is True
+    assert plotty._cfg["pane"] == "%7"
+    assert any("split-window" in " ".join(c) for c in fake_run.calls)
+    assert any("send-keys" in " ".join(c) for c in fake_run.calls)   # relaunched viewer
+
+
+def test_refresh_noop_when_pane_alive(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    fake_run.responses = {"display-message": "%9\n"}    # still alive
+    plotty._cfg.update(tmux="tmux", auto_pane=True, inline=False, pane="%9")
+    assert plotty._refresh_display_pane() is False
+    assert not any("split-window" in " ".join(c) for c in fake_run.calls)
+
+
+def test_refresh_noop_for_explicit_target(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/fake,1,0")
+    plotty._cfg.update(tmux="tmux", auto_pane=False, pane="%9")
+    assert plotty._refresh_display_pane() is False
+    assert fake_run.calls == []                         # user's pane: never touched
+
+
+# ---- user quit (Ctrl+C / q) closes plotty's own pane ------------------------
+
+def test_own_pane_is_dedicated(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    plotty._cfg.update(tmux="tmux")
+    fake_run.responses = {"show": "1\n"}
+    assert plotty._own_pane_is_dedicated() is True
+    fake_run.responses = {"show": "\n"}                 # tag unset (user's pane)
+    assert plotty._own_pane_is_dedicated() is False
+
+
+def test_own_pane_is_dedicated_no_pane(monkeypatch):
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    assert plotty._own_pane_is_dedicated() is False
+
+
+def test_kill_own_pane(fake_run, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    plotty._cfg.update(tmux="tmux")
+    plotty._kill_own_pane()
+    assert any(c[:2] == ["tmux", "kill-pane"] and "%7" in c for c in fake_run.calls)
+
+
 def test_display_figure_skipped_when_cannot_display(monkeypatch, capsys):
     plotty._cfg.update(can_display=False, inline=False)
     published = []

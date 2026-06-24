@@ -7,7 +7,7 @@ on SIGUSR1 (new figure) and SIGWINCH (pane resize/zoom). Only the rendered sixel
 bytes cross SSH, so it works the same locally and over a remote session.
 
     import plotty
-    plotty.enable()                      # auto-detects renderer + last pane
+    plotty.enable()                      # auto-detects renderer + plot pane
     plotty.enable(target_pane=2)         # or pick a pane explicitly
     plotty.disable()                     # stop the viewer + auto-display
 
@@ -25,9 +25,12 @@ Display modes: a viewer process running in a tmux pane (default in tmux), or
 pane's tty when in tmux, or to the current terminal's stdout when not. Choose
 with enable(inline=...) / PLOTTY_INLINE.
 
-plotty never draws into the pane you are typing in: if the tmux window has no
-separate pane, enable() splits one off automatically; without a usable sixel
-display (e.g. an IDE console), it warns instead of printing escape garbage.
+plotty never draws into the pane you are typing in: by default it keeps a
+dedicated plot pane in the current window, splitting one off the first time and
+reusing it afterwards (and recreating it if you close it) — so it never clobbers
+an editor or any pane you opened yourself. Pass target_pane=... to aim at a
+specific pane instead. Without a usable sixel display (e.g. an IDE console), it
+warns instead of printing escape garbage.
 
 To rename this package, just rename the file: the matplotlib backend string is
 derived from the module name automatically.
@@ -89,6 +92,11 @@ __version__ = _find_version()
 
 _ENV = "PLOTTY"   # env var prefix (kept stable even if the file is renamed)
 
+# tmux pane option that tags the dedicated plot pane enable() splits off, so it
+# can be found and reused on later enable() calls (this process or another). The
+# tag dies with the pane, so "user killed it" is just "the tag is gone".
+_DEDICATED_OPT = "@plotty"
+
 # External sixel renderer candidates (opt-in: a bare tool name like
 # imgcat="chafa" selects its template). All sixel — the only non-sixel path is
 # the built-in kitty-graphics encoder (imgcat="kitty"). Placeholders are
@@ -121,6 +129,8 @@ _cfg = {
     "inline": False,                         # set in enable(): True when not in tmux
     "can_display": True,                     # False -> no usable target; skip + warn
     "made_pane": None,                       # pane id enable() auto-split, if any
+    "auto_pane": False,                      # True -> dedicated pane, recreate if killed
+    "verbose": 1,                            # enable()'s verbosity, reused on recreate
 }
 
 _cache = os.path.expanduser(_env("CACHE", "~/.cache/plotty"))
@@ -626,8 +636,73 @@ def _resolve_pane(target):
     return str(target)
 
 
+def _split_plot_pane(own):
+    """Split a detached plot pane next to `own` (or the current pane if `own` is
+    empty); return its tmux pane id, or "" on failure. `-d` keeps focus in the
+    REPL; `-h` splits horizontally (side by side)."""
+    cmd = [_cfg["tmux"], "split-window", "-d", "-h"]
+    if own:
+        cmd += ["-t", own]
+    cmd += ["-P", "-F", "#{pane_id}"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return out.stdout.strip()
+    except OSError:
+        return ""
+
+
+def _find_dedicated_pane():
+    """The current window's pane tagged as plotty's dedicated plot pane (the
+    `@plotty` pane option), or None — for which "missing" means it was never
+    created or the user closed it (the tag is destroyed with the pane)."""
+    try:
+        out = subprocess.run(
+            [_cfg["tmux"], "list-panes", "-F", "#{pane_id} #{%s}" % _DEDICATED_OPT],
+            capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    for line in out.stdout.splitlines():
+        pane_id, _, tag = line.partition(" ")
+        if tag == "1" and pane_id:
+            return pane_id
+    return None
+
+
+def _ensure_dedicated_pane(verbose):
+    """Resolve plotty's own plot pane (the target_pane="auto" default).
+
+    Reuse the dedicated pane if it's still alive; otherwise split a fresh one and
+    tag it `@plotty` so the next enable() finds it again. Unlike picking the last
+    pane, this never draws into a pane the user opened themselves (an editor,
+    logs, …); if they close the dedicated pane, a new one is made next time. As
+    in _ensure_separate_pane, a failed split disables display with a warning
+    rather than typing into the REPL.
+    """
+    own = os.environ.get("TMUX_PANE")
+    pane = _find_dedicated_pane()
+    if pane and pane != own:
+        _cfg["made_pane"] = pane                  # plotty owns it: disable(close_pane=True)
+        return pane
+    new = _split_plot_pane(own)
+    if new:
+        subprocess.run([_cfg["tmux"], "set", "-p", "-t", new, _DEDICATED_OPT, "1"],
+                       capture_output=True, check=False)
+        _cfg["made_pane"] = new
+        if verbose:
+            print(f"[{__name__}] created dedicated plot pane {new} "
+                  f"(tmux split-window)", file=sys.stderr)
+        return new
+    _cfg["can_display"] = False
+    if verbose:
+        print(f"[{__name__}] cannot display figures: creating a dedicated plot "
+              f"pane failed — split a pane (prefix+\") and re-run enable()",
+              file=sys.stderr)
+    return pane or own or str(_cfg["pane"])
+
+
 def _ensure_separate_pane(target_pane, verbose):
-    """Resolve the target pane, creating one if the REPL's pane is the only one.
+    """Resolve an explicit target pane, creating one if the REPL's pane is the
+    only one.
 
     send-keys / sixel into the pane the user is typing in just injects garbage
     into their console — if there is no separate pane, split one off; if that
@@ -637,13 +712,7 @@ def _ensure_separate_pane(target_pane, verbose):
     own = os.environ.get("TMUX_PANE")
     if not own or pane != own:
         return pane
-    try:
-        out = subprocess.run([_cfg["tmux"], "split-window", "-d", "-h", "-t", own,
-                              "-P", "-F", "#{pane_id}"],
-                             capture_output=True, text=True, check=False)
-        new = out.stdout.strip()
-    except OSError:
-        new = ""
+    new = _split_plot_pane(own)
     if new:
         _cfg["made_pane"] = new                  # remember: disable(close_pane=True)
         if verbose:
@@ -656,6 +725,49 @@ def _ensure_separate_pane(target_pane, verbose):
               f"separate pane and creating one failed — split a pane "
               f"(prefix+\") and re-run enable()", file=sys.stderr)
     return pane
+
+
+def _resolve_display_pane(target_pane, verbose):
+    """Pick the plot pane. The default (target_pane="auto") uses plotty's
+    dedicated pane; an explicit target_pane — or PLOTTY_PANE — overrides it with
+    the classic resolution (int index, negative-from-the-end, or a named target).
+    """
+    if target_pane == "auto":
+        env_pane = _env("PANE", None)
+        if env_pane not in (None, "auto", ""):
+            _cfg["auto_pane"] = False
+            return _ensure_separate_pane(env_pane, verbose)
+        _cfg["auto_pane"] = True              # owned pane: recreate it if killed
+        return _ensure_dedicated_pane(verbose)
+    _cfg["auto_pane"] = False
+    return _ensure_separate_pane(target_pane, verbose)
+
+
+def _own_pane_is_dedicated():
+    """True if the pane this process runs in is a plotty-created dedicated pane
+    (tagged `@plotty`). Used by the viewer to decide whether it may close its own
+    pane on a user quit — a pane the user gave via target_pane is left alone."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return False
+    try:
+        out = subprocess.run([_cfg["tmux"], "show", "-pqv", "-t", pane, _DEDICATED_OPT],
+                             capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return out.stdout.strip() == "1"
+
+
+def _kill_own_pane():
+    """Close the tmux pane this process runs in (best effort)."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return
+    try:
+        subprocess.run([_cfg["tmux"], "kill-pane", "-t", pane],
+                       capture_output=True, check=False)
+    except OSError:
+        pass
 
 
 # ---- talking to the viewer (or send-keys fallback) --------------------------
@@ -765,19 +877,54 @@ def _pane_tty(pane):
     return tty or None
 
 
+def _pane_alive(pane):
+    """True if `pane` is still a live tmux pane. Errors are captured, so probing a
+    pane the user has since closed is silent (no 'can't find pane' on the REPL)."""
+    try:
+        out = subprocess.run(
+            [_cfg["tmux"], "display-message", "-p", "-t", str(pane), "#{pane_id}"],
+            capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return out.returncode == 0 and bool(out.stdout.strip())
+
+
+def _refresh_display_pane():
+    """Recreate the dedicated plot pane if the user has closed it (auto mode only).
+
+    Without this, every later figure would send-keys / write into a dead pane id
+    and tmux would print 'can't find pane: %N'. Returns True when it actually
+    recreated the pane — the caller then lets the relaunched viewer draw the
+    just-published figure on startup, instead of also signalling/emitting into a
+    pane whose shell may still be coming up.
+    """
+    if not _cfg.get("auto_pane") or os.environ.get("TMUX") is None:
+        return False                             # explicit target: user's to manage
+    if _pane_alive(_cfg["pane"]):
+        return False
+    _cfg["made_pane"] = None
+    _cfg["pane"] = _ensure_dedicated_pane(_cfg.get("verbose", 0))
+    if _cfg.get("can_display", True) and not _cfg["inline"]:
+        _ensure_viewer()
+    return True
+
+
 def _write_inline(path):
     """Render sixel without a viewer: to the target tmux pane's tty when in tmux,
     otherwise to this terminal's own stdout."""
     try:
         if os.environ.get("TMUX") is not None:
             tty = _pane_tty(_cfg["pane"])
-            if tty:
-                with open(tty, "wb", buffering=0) as out:
-                    data = _render_bytes(path, out.fileno())
-                    if _cfg["clear"]:
-                        out.write(b"\x1b[H\x1b[2J")
-                    out.write(data)
+            if not tty:                          # pane gone: don't dump into the REPL
+                _warn_once("inline_tty", "plot pane is gone — re-run enable() to "
+                                         "get a new one")
                 return
+            with open(tty, "wb", buffering=0) as out:
+                data = _render_bytes(path, out.fileno())
+                if _cfg["clear"]:
+                    out.write(b"\x1b[H\x1b[2J")
+                out.write(data)
+            return
         data = _render_bytes(path, _out_fd())
         buf = sys.stdout.buffer
         buf.write(data)
@@ -851,8 +998,13 @@ def _display_figure(fig):
         return
     if not _publish(fig):
         return
+    recreated = _refresh_display_pane()          # closed dedicated pane -> new one
+    if not _cfg.get("can_display", True):
+        return                                   # recreation failed: warn next call
     if _cfg["inline"]:
         _write_inline(_last)
+    elif recreated:
+        pass                                     # the relaunched viewer draws _last
     elif not _signal_viewer():
         _emit()
 
@@ -905,9 +1057,14 @@ def save(path):
 def redraw():
     if not _cfg.get("can_display", True):
         return
+    recreated = _refresh_display_pane()
+    if not _cfg.get("can_display", True):
+        return
     if _cfg["inline"]:
         if os.path.exists(_last):
             _write_inline(_last)
+    elif recreated:
+        pass                                     # the relaunched viewer draws _last
     elif not _signal_viewer() and os.path.exists(_last):
         _emit()
 
@@ -918,6 +1075,11 @@ def view():
     """Viewer loop: redraw on SIGUSR1 (new figure) / SIGWINCH (resize), exit on
     SIGTERM/SIGINT/SIGHUP. When the pane tty is interactive, single keys
     navigate figure history: p/k = older, n/j = newer, q = quit.
+
+    A *user* quit — Ctrl+C (SIGINT) or 'q' — of a plotty-owned dedicated pane
+    closes that pane rather than leaving a half-dead shell prompt with a stale
+    plot and no navigation; the next figure splits a fresh pane. SIGTERM/SIGHUP
+    (disable, viewer restart, or a pane already dying) just exit the process.
 
     Signal handlers do no work — the kernel writes the signal number to a
     self-pipe (signal.set_wakeup_fd) and all rendering/writing happens in the
@@ -936,8 +1098,10 @@ def view():
     quit_sigs = {int(getattr(signal, n)) for n in ("SIGTERM", "SIGINT", "SIGHUP")
                  if hasattr(signal, n)}
     usr1 = int(getattr(signal, "SIGUSR1", -1))
+    sigint = int(getattr(signal, "SIGINT", -1))
     kb_fd = kb_old = None
     offset = 0                                   # 0 = live; k > 0 = k figures back
+    kill_pane = False                            # set on a user quit of an owned pane
 
     def _cleanup():
         if kb_old is not None:
@@ -1015,6 +1179,13 @@ def view():
             if kb_fd is not None and kb_fd in ready:
                 keys = os.read(kb_fd, 16)
             if (sigs & quit_sigs) or b"q" in keys:
+                # A user quit (Ctrl+C, or 'q') of plotty's own pane closes that
+                # pane outright, rather than dropping to a shell prompt with a
+                # stale plot and no navigation; the next figure splits a fresh
+                # one. SIGTERM/SIGHUP (disable / restart / pane already dying)
+                # just exit and leave pane management to the backend.
+                if ((sigint in sigs) or (b"q" in keys)) and _own_pane_is_dedicated():
+                    kill_pane = True
                 break
             redraw = bool(sigs & draw_sigs)
             if usr1 in sigs:
@@ -1031,6 +1202,8 @@ def view():
     except BaseException:
         pass                                     # never crash out of the viewer
     _cleanup()
+    if kill_pane:
+        _kill_own_pane()                         # after cleanup: pidfile + termios first
     os._exit(0)
 
 
@@ -1053,6 +1226,7 @@ def _ensure_viewer():
         f"{_ENV}_CLEAR={'1' if _cfg['clear'] else '0'}",
         f"{_ENV}_CACHE={shlex.quote(_cache)}",
         f"{_ENV}_SIZE={shlex.quote(str(_cfg['size']))}",
+        f"{_ENV}_TMUX={shlex.quote(_cfg['tmux'])}",   # so the viewer can run tmux
     ]
     launch = (
         " ".join(parts)
@@ -1235,10 +1409,18 @@ def _resolve_imgcat(imgcat, verbose):
     return imgcat
 
 
-def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
+def enable(target_pane="auto", imgcat=None, clear=True, tmux="tmux", dpi=None,
            close=True, size=None, bg=None, hist=None, inline=None, viewer=True,
            verbose=1):
     """Activate plotty: detect a renderer, point at a pane, start the viewer.
+
+    target_pane="auto" (default; `PLOTTY_PANE` unset) uses a dedicated plot pane
+    in the current tmux window: enable() splits one off the first time, reuses it
+    on later calls, and recreates it if you close it — so plotty never draws into
+    a pane you opened yourself (an editor, logs, …). Override it with an explicit
+    target: an int indexes the window's panes (negative counts from the end,
+    `-1` = last), or pass a tmux target name like "sess:win.pane". `PLOTTY_PANE`
+    sets the default and, when set, also overrides "auto".
 
     inline=None (default) auto-selects: inline mode when not in tmux, viewer-pane
     mode when in tmux. In inline mode the backend renders sixel itself (no viewer
@@ -1280,6 +1462,7 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     _cfg["bg"] = _env("BG", None) if bg is None else bg
     _cfg["hist"] = _env("HIST", "10") if hist is None else hist
     _cfg["made_pane"] = None
+    _cfg["verbose"] = verbose                    # reused when recreating a killed pane
 
     _cfg["imgcat"] = _resolve_imgcat(imgcat, verbose)
     _write_config()                              # viewer re-reads this per draw
@@ -1299,7 +1482,7 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
     if _cfg["inline"]:
         if intmux:
             # pipe sixel to a separate pane's tty (never the REPL's own pane)
-            _cfg["pane"] = _ensure_separate_pane(target_pane, verbose)
+            _cfg["pane"] = _resolve_display_pane(target_pane, verbose)
         elif inline is not True and _cfg["imgcat"] != "kitty":
             # auto-selected inline: verify the terminal renders sixel (the kitty
             # encoder is an explicit opt-in and doesn't need the sixel attribute)
@@ -1311,7 +1494,7 @@ def enable(target_pane=-1, imgcat=None, clear=True, tmux="tmux", dpi=None,
                           f"sixel-capable terminal or tmux; enable(inline=True) "
                           f"forces output anyway)", file=sys.stderr)
     else:
-        _cfg["pane"] = _ensure_separate_pane(target_pane, verbose)
+        _cfg["pane"] = _resolve_display_pane(target_pane, verbose)
         if _cfg["can_display"] and viewer:
             _ensure_viewer()
     hook()
