@@ -133,12 +133,44 @@ _cfg = {
     "verbose": 1,                            # enable()'s verbosity, reused on recreate
 }
 
-_cache = os.path.expanduser(_env("CACHE", "~/.cache/plotty"))
-os.makedirs(_cache, exist_ok=True)
-_last = os.path.join(_cache, "last.png")
-_pidfile = os.path.join(_cache, "viewer.pid")
-_config = os.path.join(_cache, "config.json")
-_histdir = os.path.join(_cache, "hist")
+def _set_cache(path):
+    """Point the cache-path globals at `path` (and create it). Set to the base
+    dir at import; enable() re-points it at a per-tmux-window subdir so concurrent
+    REPLs don't share one viewer/last.png. Child processes (viewer, --render)
+    receive the resolved path via PLOTTY_CACHE and never re-key it."""
+    global _cache, _last, _pidfile, _config, _histdir
+    _cache = path
+    try:
+        os.makedirs(_cache, exist_ok=True)
+    except OSError:
+        pass
+    _last = os.path.join(_cache, "last.png")
+    _pidfile = os.path.join(_cache, "viewer.pid")
+    _config = os.path.join(_cache, "config.json")
+    _histdir = os.path.join(_cache, "hist")
+
+
+def _window_cache(base):
+    """Per-tmux-window cache subdir (`<base>/win-<window_id>`), so REPLs in
+    different windows get independent viewers + last.png instead of fighting over
+    one. Falls back to `base` outside tmux or when the window id can't be read."""
+    if os.environ.get("TMUX") is None:
+        return base
+    own = os.environ.get("TMUX_PANE")
+    cmd = [_cfg["tmux"], "display-message", "-p"]
+    if own:                                      # resolve OUR window, not whatever
+        cmd += ["-t", own]                       # window the client has focused
+    cmd += ["#{window_id}"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        wid = out.stdout.strip().lstrip("@")
+    except OSError:
+        wid = ""
+    return os.path.join(base, f"win-{wid}") if wid else base
+
+
+_base_cache = os.path.expanduser(_env("CACHE", "~/.cache/plotty"))
+_set_cache(_base_cache)
 
 _warned = set()
 
@@ -622,11 +654,14 @@ def _resolve_pane(target):
         return str(target)                     # named target, e.g. "Plots:0.0"
     if idx >= 0:
         return str(idx)
+    own = os.environ.get("TMUX_PANE")
+    cmd = [_cfg["tmux"], "list-panes"]
+    if own:                                        # the REPL's own window, not the
+        cmd += ["-t", own]                         # client's currently-focused one
+    cmd += ["-F", "#{pane_id}"]
     try:
-        out = subprocess.run([_cfg["tmux"], "list-panes", "-F", "#{pane_id}"],
-                             capture_output=True, text=True, check=False)
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False)
         ids = out.stdout.split()
-        own = os.environ.get("TMUX_PANE")
         if len(ids) > 1 and own in ids:
             ids.remove(own)
         if ids:
@@ -636,11 +671,33 @@ def _resolve_pane(target):
     return str(target)
 
 
+_CELL_ASPECT = 2.0   # terminal cell height:width (a cell is ~twice as tall as wide)
+
+
+def _split_direction(pane):
+    """Split `pane` along its longer visual side: '-h' (left/right, plot beside)
+    when it's wider than tall, else '-v' (top/bottom, plot below). Cells are
+    ~2x taller than wide, so rows are scaled before the comparison. Defaults to
+    '-h' when the pane size can't be read."""
+    cmd = [_cfg["tmux"], "display-message", "-p"]
+    if pane:
+        cmd += ["-t", str(pane)]
+    cmd += ["#{pane_width} #{pane_height}"]
+    try:
+        parts = subprocess.run(cmd, capture_output=True, text=True,
+                               check=False).stdout.split()
+        cols, rows = int(parts[0]), int(parts[1])
+    except (OSError, ValueError, IndexError):
+        return "-h"
+    return "-v" if (cols and rows and rows * _CELL_ASPECT > cols) else "-h"
+
+
 def _split_plot_pane(own):
-    """Split a detached plot pane next to `own` (or the current pane if `own` is
-    empty); return its tmux pane id, or "" on failure. `-d` keeps focus in the
-    REPL; `-h` splits horizontally (side by side)."""
-    cmd = [_cfg["tmux"], "split-window", "-d", "-h"]
+    """Split a detached plot pane off `own` (or the current pane if `own` is
+    empty), along its longer side so the plot pane stays well-proportioned (wide
+    pane -> beside, tall pane -> below); return its tmux pane id, or "" on
+    failure. `-d` keeps focus in the REPL."""
+    cmd = [_cfg["tmux"], "split-window", "-d", _split_direction(own)]
     if own:
         cmd += ["-t", own]
     cmd += ["-P", "-F", "#{pane_id}"]
@@ -652,13 +709,20 @@ def _split_plot_pane(own):
 
 
 def _find_dedicated_pane():
-    """The current window's pane tagged as plotty's dedicated plot pane (the
+    """The REPL window's pane tagged as plotty's dedicated plot pane (the
     `@plotty` pane option), or None — for which "missing" means it was never
-    created or the user closed it (the tag is destroyed with the pane)."""
+    created or the user closed it (the tag is destroyed with the pane).
+
+    Scoped to the REPL's own window via $TMUX_PANE, not the window the client
+    happens to have focused — otherwise a backgrounded REPL would find (and
+    reuse) some other window's plot pane."""
+    own = os.environ.get("TMUX_PANE")
+    cmd = [_cfg["tmux"], "list-panes"]
+    if own:
+        cmd += ["-t", own]
+    cmd += ["-F", "#{pane_id} #{%s}" % _DEDICATED_OPT]
     try:
-        out = subprocess.run(
-            [_cfg["tmux"], "list-panes", "-F", "#{pane_id} #{%s}" % _DEDICATED_OPT],
-            capture_output=True, text=True, check=False)
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except OSError:
         return None
     for line in out.stdout.splitlines():
@@ -1455,6 +1519,7 @@ def enable(target_pane="auto", imgcat=None, clear=True, tmux="tmux", dpi=None,
     restarts it in the new pane).
     """
     _cfg["tmux"] = tmux
+    _set_cache(_window_cache(os.path.expanduser(_env("CACHE", "~/.cache/plotty"))))
     _cfg["clear"] = clear
     _cfg["dpi"] = _env("DPI", None) if dpi is None else dpi
     _cfg["close"] = close
@@ -1500,11 +1565,13 @@ def enable(target_pane="auto", imgcat=None, clear=True, tmux="tmux", dpi=None,
     hook()
 
 
-def disable(close_pane=False, verbose=1):
+def disable(close_pane=True, verbose=1):
     """Stop the viewer, unhook auto-display, and quiet matplotlib output.
 
-    close_pane=True also closes the plot pane — but only if enable() created
-    it via auto-split (a pane the user made themselves is never touched)."""
+    By default (close_pane=True) it also closes plotty's plot pane — but only the
+    pane enable() created via auto-split; a pane you passed via target_pane (or
+    made yourself) is never touched. Pass close_pane=False to leave the
+    auto-created pane open, e.g. to keep the last figure on screen."""
     pid = _read_pid()
     if _alive(pid) and _is_viewer(pid):
         try:
