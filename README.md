@@ -87,7 +87,7 @@ uv pip install .
 ```python
 import plotty
 plotty.enable()                 # auto-detect the renderer (sixel or kitty
-                                # graphics), target the last tmux pane, and
+                                # graphics), use a dedicated plot pane, and
                                 # spawn a tiny viewer there
 
 import matplotlib.pyplot as plt
@@ -98,10 +98,12 @@ plt.plot([1, 4, 9, 16])
 plotty.disable()                # stop the viewer and restore matplotlib
 ```
 
-Inside tmux, plotty draws into another pane of the current window (the last one
-that isn't your REPL). If the window only has your REPL pane, `enable()`
-automatically splits off a plot pane. Target a specific pane with
-`enable(target_pane=...)`.
+Inside tmux, plotty draws into a dedicated plot pane in the current window. The
+first `enable()` splits one off next to your REPL and reuses it on later calls;
+if you close that pane, the next `enable()` makes a new one. So plotty never
+hijacks a pane you opened yourself (an editor, logs, …). Target a specific pane
+instead with `enable(target_pane=...)` — an int indexes the window's panes
+(`-1` = last), or pass a name like `sess:win.pane`.
 
 Public API: `enable()`, `disable()`, `redraw()`, `show(fig)`, `save(path)`,
 `status()`, `view()`, `__version__`. `status()` prints a diagnostic summary
@@ -144,8 +146,11 @@ is identical to local.
   pane and redraws on new figures *and* on pane resize/zoom. Recommended; it's
   the mode that survives resizing. The plot pane also takes single keys:
   **`p`/`k`** step back through recent figures, **`n`/`j`** step forward,
-  **`q`** quits the viewer. Re-running `enable(size=…, bg=…)` updates a running
-  viewer live; a new `target_pane` moves it.
+  **`q`** quits. `q` or `Ctrl+C` in an auto-created plot pane closes that pane
+  (the next figure splits a fresh one), so you never get stranded at a shell
+  prompt with a stale plot; a pane you passed via `target_pane` is left open.
+  Re-running `enable(size=…, bg=…)` updates a running viewer live; a new
+  `target_pane` moves it.
 - **Inline mode** (default outside tmux, or `enable(inline=True)`) — the backend
   renders sixel itself, with no helper process, and writes it to the target
   pane's tty (in tmux) or to your stdout (no tmux). It does **not** auto-redraw
@@ -265,7 +270,7 @@ Both tmux layers must be ≥ 3.4 and built with sixel.
 
 | argument | env var | default | meaning |
 |---|---|---|---|
-| `target_pane` | `PLOTTY_PANE` | `-1` | tmux pane for the plot; negative indexes from the end (`-1` = last) |
+| `target_pane` | `PLOTTY_PANE` | `auto` | `auto` = a dedicated split pane, reused across calls (recreated if closed); or an int pane index (negative from the end, `-1` = last), or a name like `sess:win.pane` |
 | `size` | `PLOTTY_SIZE` | `60` | display width in terminal cells |
 | `dpi` | `PLOTTY_DPI` | matplotlib default | `savefig` DPI of the source image (raise it for sharper plots at large `size`) |
 | `imgcat` | `PLOTTY_IMGCAT` | auto-detect | picks built-in sixel or kitty-graphics by terminal; `"builtin"` forces sixel, `"kitty"` forces kitty graphics, `"chafa"`/`"img2sixel"`/`"magick"` use that tool, or a custom command |
