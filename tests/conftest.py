@@ -64,5 +64,9 @@ def _isolate():
             pass
     shutil.rmtree(plotty._histdir, ignore_errors=True)
     yield
+    if getattr(plotty, "_plotly_on", False):     # enable() may register the plotly
+        plotty._unregister_plotly()              # renderer; restore pio's default
+    if getattr(plotty, "_plotly_server", False):  # and tear down a stray kaleido server
+        plotty._stop_plotly_server()
     plotty._cfg.clear()
     plotty._cfg.update(snap)

@@ -32,12 +32,21 @@ an editor or any pane you opened yourself. Pass target_pane=... to aim at a
 specific pane instead. Without a usable sixel display (e.g. an IDE console), it
 warns instead of printing escape garbage.
 
+plotly figures render in the same pane when the optional `plotty[plotly]` extra
+is installed: enable() registers a plotly renderer and makes it the default, so a
+figure left as a cell's result auto-displays just like matplotlib (export goes
+through kaleido). The core matplotlib path never imports plotly. kaleido drives a
+headless Chrome; plotty keeps it warm with a persistent server so only the first
+figure is slow (later ones ~65 ms). The server is torn down on disable()/exit and
+cannot orphan Chrome on a hard kill (pipe transport — Chrome dies with the parent).
+
 To rename this package, just rename the file: the matplotlib backend string is
 derived from the module name automatically.
 
 Config via env vars (optional; enable() args override): PLOTTY_PANE,
 PLOTTY_IMGCAT, PLOTTY_CLEAR, PLOTTY_TMUX, PLOTTY_DPI, PLOTTY_CLOSE, PLOTTY_CACHE,
-PLOTTY_SIZE, PLOTTY_INLINE, PLOTTY_BG, PLOTTY_HIST.
+PLOTTY_SIZE, PLOTTY_INLINE, PLOTTY_BG, PLOTTY_HIST, PLOTTY_PLOTLY_SCALE,
+PLOTTY_PLOTLY_SERVER.
 
 In the viewer pane: p/k = previous figure, n/j = next, q = quit. Re-running
 enable() with new settings updates a running viewer live.
@@ -1034,18 +1043,13 @@ def _record_history():
         pass
 
 
-def _publish(fig):
-    """Save the figure once, straight to last.png via temp-file + os.replace
-    (atomic hand-off: the viewer never sees a partial file). True on success."""
-    kw = {"format": "png", "bbox_inches": "tight"}
-    if _cfg["dpi"]:
-        try:
-            kw["dpi"] = float(_cfg["dpi"])
-        except (TypeError, ValueError):
-            _warn_once("dpi", f"ignoring invalid dpi {_cfg['dpi']!r}")
+def _publish_via(write_to_tmp):
+    """Run write_to_tmp(tmp_path) to build a PNG, then atomically swap it into
+    last.png (temp file + os.replace, so the viewer never sees a partial file)
+    and snapshot it into history. True on success."""
     tmp = _last + ".part"
     try:
-        fig.savefig(tmp, **kw)
+        write_to_tmp(tmp)
         os.replace(tmp, _last)
     except OSError as exc:
         _warn_once("publish", f"cannot write {_last}: {exc}")
@@ -1054,14 +1058,38 @@ def _publish(fig):
     return True
 
 
-def _display_figure(fig):
-    if not _cfg.get("can_display", True):
-        _warn_once("display", "figure not displayed — no usable display target "
-                              "(see the enable() warnings); fix it and re-run "
-                              "enable()")
-        return
-    if not _publish(fig):
-        return
+def _publish(fig):
+    """Render a matplotlib Figure straight to last.png. True on success."""
+    kw = {"format": "png", "bbox_inches": "tight"}
+    if _cfg["dpi"]:
+        try:
+            kw["dpi"] = float(_cfg["dpi"])
+        except (TypeError, ValueError):
+            _warn_once("dpi", f"ignoring invalid dpi {_cfg['dpi']!r}")
+    return _publish_via(lambda tmp: fig.savefig(tmp, **kw))
+
+
+def _publish_bytes(data):
+    """Publish ready-made PNG bytes (e.g. a plotly/kaleido export) to last.png."""
+    def _write(tmp):
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+    return _publish_via(_write)
+
+
+def _can_display():
+    """True if a display target is usable; else warn once and return False."""
+    if _cfg.get("can_display", True):
+        return True
+    _warn_once("display", "figure not displayed — no usable display target "
+                          "(see the enable() warnings); fix it and re-run "
+                          "enable()")
+    return False
+
+
+def _present():
+    """Push the just-published last.png to the pane — recreating a closed
+    dedicated pane first, then signalling the viewer (or inline / send-keys)."""
     recreated = _refresh_display_pane()          # closed dedicated pane -> new one
     if not _cfg.get("can_display", True):
         return                                   # recreation failed: warn next call
@@ -1071,6 +1099,164 @@ def _display_figure(fig):
         pass                                     # the relaunched viewer draws _last
     elif not _signal_viewer():
         _emit()
+
+
+def _display_figure(fig):
+    if _can_display() and _publish(fig):
+        _present()
+
+
+def _display_bytes(data):
+    """Display already-rendered PNG bytes through the same pipeline as figures."""
+    if _can_display() and _publish_bytes(data):
+        _present()
+
+
+# ---- plotly support (optional: `pip install 'plotty[plotly]'`) --------------
+#
+# Everything below _publish is format-agnostic — any PNG that lands in last.png
+# renders in the pane — so plotly support is just "figure -> PNG bytes ->
+# _display_bytes". Static export goes through kaleido (plotly's image engine).
+# For a Jupyter-like feel we also register a plotly *renderer* and make it the
+# default: a plotly figure left as a cell's result then auto-displays in the plot
+# pane (and fig.show() routes there too), the analogue of the matplotlib backend's
+# post_run_cell hook. Nothing here imports plotly unless it's installed.
+
+_plotly_on = False
+_plotly_saved = None             # (default, render_on_display) to restore on disable()
+_plotly_server = False           # True while a persistent kaleido (Chrome) server is up
+_plotly_atexit = False           # _stop_plotly_server registered with atexit once
+
+
+def _ensure_plotly_server():
+    """Start a persistent kaleido server once and keep Chrome alive across renders.
+
+    kaleido drives a headless Chrome to export PNGs; left to itself plotly's
+    to_image relaunches Chrome on every figure (~1.3 s each). A persistent server
+    pays that startup once — the first figure is still slow, but later ones drop
+    to ~65 ms (about 20x faster, ~2x matplotlib). Best-effort: any failure falls
+    back to per-call rendering. Opt out with PLOTTY_PLOTLY_SERVER=0."""
+    global _plotly_server, _plotly_atexit
+    if _plotly_server or str(_env("PLOTLY_SERVER", "1")) == "0":
+        return
+    try:
+        import kaleido
+        kaleido.start_sync_server()
+    except Exception as exc:
+        _warn_once("plotly_server",
+                   f"persistent kaleido server unavailable ({exc}); each plotly "
+                   f"render will relaunch Chrome (slower)")
+        return
+    _plotly_server = True
+    if not _plotly_atexit:
+        import atexit
+        atexit.register(_stop_plotly_server)
+        _plotly_atexit = True
+
+
+def _stop_plotly_server():
+    global _plotly_server
+    if not _plotly_server:
+        return
+    _plotly_server = False
+    try:
+        import kaleido
+        kaleido.stop_sync_server()
+    except Exception:
+        pass
+
+
+def _is_plotly_fig(obj):
+    """True for a plotly figure (graph_objects.Figure / FigureWidget)."""
+    if hasattr(obj, "savefig"):
+        return False                             # a matplotlib figure
+    mod = getattr(type(obj), "__module__", "") or ""
+    return mod.startswith("plotly") and hasattr(obj, "to_dict")
+
+
+def _plotly_png(fig):
+    """Render a plotly figure (or fig dict) to PNG bytes via kaleido. Returns None
+    and warns once if plotly/kaleido is missing or the export fails."""
+    try:
+        import plotly.io as pio
+    except Exception:
+        _warn_once("plotly", "plotly is not installed — "
+                             "`pip install 'plotty[plotly]'`")
+        return None
+    _ensure_plotly_server()                      # keep Chrome warm across renders
+    kw = {"format": "png"}
+    scale = _cfg.get("plotly_scale")
+    if scale:
+        try:
+            kw["scale"] = float(scale)
+        except (TypeError, ValueError):
+            pass
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            # plotly warns that per-call kaleido options are ignored while a
+            # server runs; the per-figure format/scale we use still apply.
+            warnings.filterwarnings("ignore", message=".*kopts argument is ignored.*")
+            return pio.to_image(fig, **kw)
+    except Exception as exc:
+        _warn_once("plotly_export",
+                   f"plotly image export failed ({exc}) — install kaleido: "
+                   f"`pip install 'plotty[plotly]'`")
+        return None
+
+
+def _show_plotly(fig):
+    data = _plotly_png(fig)
+    if data is not None:
+        _display_bytes(data)
+
+
+def _register_plotly():
+    """If plotly is importable, register a 'plotty' renderer and make it the
+    default, so plotly figures auto-display in the plot pane and fig.show() routes
+    here. Silent no-op when plotly isn't installed."""
+    global _plotly_on, _plotly_saved
+    try:
+        import plotly.io as pio
+        from plotly.io._base_renderers import ExternalRenderer
+    except Exception:
+        return                                   # plotly absent: nothing to wire up
+    if "plotty" not in pio.renderers:
+        class _PlottyRenderer(ExternalRenderer):
+            """Draws each figure into the tmux plot pane instead of a browser."""
+
+            def render(self, fig_dict):
+                _show_plotly(fig_dict)
+
+        pio.renderers["plotty"] = _PlottyRenderer()
+    if not _plotly_on:                           # remember what to restore later
+        _plotly_saved = (pio.renderers.default,
+                         getattr(pio.renderers, "render_on_display", None))
+    pio.renderers.default = "plotty"
+    try:
+        pio.renderers.render_on_display = True   # fire _ipython_display_ in the REPL
+    except Exception:
+        pass
+    _plotly_on = True
+
+
+def _unregister_plotly():
+    """Restore plotly's previous default renderer and stop the kaleido server."""
+    global _plotly_on, _plotly_saved
+    _stop_plotly_server()
+    if not _plotly_on:
+        return
+    try:
+        import plotly.io as pio
+        default, rod = _plotly_saved or (None, None)
+        if default is not None:
+            pio.renderers.default = default
+        if rod is not None:
+            pio.renderers.render_on_display = rod
+    except Exception:
+        pass
+    _plotly_on = False
+    _plotly_saved = None
 
 
 # ---- matplotlib backend API -------------------------------------------------
@@ -1092,13 +1278,17 @@ def draw_if_interactive():
 
 
 def show(fig=None, *args, **kwargs):
-    """Display pyplot-managed figures, or an explicit Figure passed as `fig`.
+    """Display pyplot-managed figures, or an explicit figure passed as `fig`.
 
     Passing a figure covers non-pyplot figures (matplotlib.figure.Figure built
-    directly), which never register with pyplot and would otherwise not show.
-    Such figures are not auto-closed."""
+    directly), which never register with pyplot and would otherwise not show, as
+    well as plotly figures (rendered to PNG via kaleido). Such figures are not
+    auto-closed."""
     if fig is not None:
-        _display_figure(fig)
+        if _is_plotly_fig(fig):
+            _show_plotly(fig)
+        else:
+            _display_figure(fig)
         return
     managers = Gcf.get_all_fig_managers()
     if not managers:
@@ -1526,6 +1716,7 @@ def enable(target_pane="auto", imgcat=None, clear=True, tmux="tmux", dpi=None,
     _cfg["size"] = _env("SIZE", 60) if size is None else size
     _cfg["bg"] = _env("BG", None) if bg is None else bg
     _cfg["hist"] = _env("HIST", "10") if hist is None else hist
+    _cfg["plotly_scale"] = _env("PLOTLY_SCALE", 2)   # kaleido resolution multiplier
     _cfg["made_pane"] = None
     _cfg["verbose"] = verbose                    # reused when recreating a killed pane
 
@@ -1563,6 +1754,7 @@ def enable(target_pane="auto", imgcat=None, clear=True, tmux="tmux", dpi=None,
         if _cfg["can_display"] and viewer:
             _ensure_viewer()
     hook()
+    _register_plotly()                           # auto-display plotly figures too
 
 
 def disable(close_pane=True, verbose=1):
@@ -1589,6 +1781,7 @@ def disable(close_pane=True, verbose=1):
         except Exception:
             pass
         _hook_cb = None
+    _unregister_plotly()
     try:
         matplotlib.use("agg")
     except Exception:
@@ -1629,6 +1822,7 @@ def status():
         f"  size:      {_cfg['size']} cells   dpi: {_cfg['dpi'] or 'default'}   "
         f"bg: {_cfg.get('bg') or 'white'}",
         f"  viewer:    {viewer}",
+        f"  plotly:    {('auto-display on' + (', kaleido server up' if _plotly_server else '')) if _plotly_on else 'off'}",
         f"  last fig:  {last}   history: {len(_hist_files())} kept",
         f"  cache:     {_cache}",
     ]
