@@ -127,6 +127,66 @@ python examples/demo.py
   <img src="images/plotty_2.gif" alt="plotty rendering the examples/demo.py plots in a tmux pane" width="720">
 </p>
 
+## Plotly figures
+
+plotty can render [plotly](https://plotly.com/python/) figures in the same plot
+pane, the way they appear inline in a Jupyter notebook — no browser. It's an
+opt-in extra (plotly exports static images through
+[`kaleido`](https://github.com/plotly/Kaleido), which needs a Chrome/Chromium;
+the core matplotlib path stays zero-dependency and never imports either):
+
+```bash
+uv pip install 'plotty[plotly]'     # or: pip install 'plotty[plotly]'
+```
+
+Then nothing special is needed — `enable()` registers a plotly renderer and makes
+it the default, so a figure left as a cell's result auto-displays in the pane,
+exactly like matplotlib:
+
+```python
+import plotty
+plotty.enable()
+
+import plotly.express as px
+fig = px.scatter(x=[1, 2, 3, 4], y=[1, 4, 9, 16])
+fig                      # IPython: shows up in the plot pane after the cell
+# fig.show()             # plain REPL: routes to the pane too
+# plotty.show(fig)       # or display any figure explicitly
+```
+
+Both kinds coexist — matplotlib via its backend + auto-display hook, plotly via
+its renderer — so you can mix them in one session. `disable()` restores plotly's
+previous default renderer. Source resolution is controlled by `PLOTTY_PLOTLY_SCALE`
+(kaleido's scale multiplier, default `2`); raise it for crisper plots at large
+`size`, the plotly analogue of `dpi`.
+
+> Needs the `[plotly]` extra installed *and* a Chrome/Chromium for kaleido. If
+> the export can't run, plotty prints a one-time hint (`plotly_get_chrome`
+> installs one) instead of failing your cell.
+
+### Performance
+
+plotly exports static images by driving a headless Chrome through kaleido, which
+is inherently heavier than matplotlib's in-process Agg renderer (~30 ms/figure).
+Left alone, plotly relaunches Chrome on every figure (~1.3 s each). plotty avoids
+that by starting a **persistent kaleido server** the first time you plot and
+keeping Chrome warm, so only the first figure pays the startup cost and later ones
+render in ~65 ms (≈2× matplotlib):
+
+| | first figure | each later figure |
+|---|---|---|
+| matplotlib | ~50 ms | ~30 ms |
+| plotly (persistent server, default) | ~1.3 s | **~65 ms** |
+| plotly (`PLOTTY_PLOTLY_SERVER=0`) | ~1.3 s | ~1.3 s |
+
+The server (and its Chrome) is torn down by `disable()` and at interpreter exit.
+It cannot be orphaned even on a sudden, uncatchable kill of your REPL (SIGKILL,
+crash, dropped SSH): kaleido drives Chrome over a pipe, so when the parent dies
+the pipe breaks and Chrome exits with it — verified by a regression test that
+hard-kills the parent and asserts no Chrome survives. Set `PLOTTY_PLOTLY_SERVER=0`
+to opt out of the persistent server (every render relaunches Chrome) if you'd
+rather not keep a browser resident.
+
 ## How it works
 
 Two cooperating pieces share state via the filesystem + OS signals:
@@ -289,6 +349,8 @@ Both tmux layers must be ≥ 3.4 and built with sixel.
 | `tmux` | `PLOTTY_TMUX` | `tmux` | tmux binary to use |
 | `viewer` | — | `True` | spawn the viewer process (tmux mode) |
 | `verbose` | — | `1` | print startup health-check warnings |
+| — | `PLOTTY_PLOTLY_SCALE` | `2` | kaleido resolution multiplier for plotly figures (the plotly analogue of `dpi`); only used with the `[plotly]` extra |
+| — | `PLOTTY_PLOTLY_SERVER` | `1` | keep a persistent kaleido (Chrome) server warm across plotly renders (~20× faster after the first); `0` relaunches Chrome per figure |
 | — | `PLOTTY_CACHE` | `~/.cache/plotty` | base state directory; inside tmux each window gets its own `win-<id>/` subdir (`last.png`, pidfile) so concurrent REPLs don't collide |
 
 `size` and `dpi` are independent: `size` is how wide the image is *displayed*,

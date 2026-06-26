@@ -1,6 +1,6 @@
 [project]
 name = "plotty"
-version = "1.4.0"
+version = "1.5.0"
 description = "Inline matplotlib plots in your terminal via sixel, in a tmux pane, over SSH"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -27,6 +27,15 @@ dependencies = [
     "numpy>=1.17",
 ]
 
+# Optional: render plotly figures in the pane too. plotly does static PNG export
+# through kaleido; both are pulled in by `pip install 'plotty[plotly]'`. The core
+# matplotlib path stays zero-dependency and never imports either.
+[project.optional-dependencies]
+plotly = [
+    "plotly>=5.0",
+    "kaleido",
+]
+
 [project.urls]
 Homepage = "https://github.com/xuesoso/plotty"
 Repository = "https://github.com/xuesoso/plotty"
@@ -49,6 +58,9 @@ py-modules = ["plotty"]
 dev = [
     "pytest>=7.0",
     "ipython>=7.0",
+    "plotly>=5.0",
+    "kaleido",
+    "pandas",
 ]
 
 [tool.ruff]
